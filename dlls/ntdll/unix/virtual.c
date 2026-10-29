@@ -213,6 +213,7 @@ static const size_t pages_vprot_shift = 20;
 static const size_t pages_vprot_mask = (1 << 20) - 1;
 static size_t pages_vprot_size;
 static BYTE **pages_vprot;
+static BYTE *pages_vprot_dirty;  /* per chunk: set once the chunk holds a non-zero byte */
 #else  /* on 32-bit we use a simple array with one byte per page */
 static BYTE *pages_vprot;
 #endif
@@ -906,13 +907,20 @@ static void set_page_vprot( const void *addr, size_t size, BYTE vprot )
     size_t end = ((size_t)addr + size + page_mask) >> page_shift;
 
 #ifdef _WIN64
-    while (idx >> pages_vprot_shift != end >> pages_vprot_shift)
+    while (idx < end)
     {
-        size_t dir_size = pages_vprot_mask + 1 - (idx & pages_vprot_mask);
-        memset( pages_vprot[idx >> pages_vprot_shift] + (idx & pages_vprot_mask), vprot, dir_size );
-        idx += dir_size;
+        size_t chunk = idx >> pages_vprot_shift;
+        size_t count = min( end - idx, pages_vprot_mask + 1 - (idx & pages_vprot_mask) );
+
+        /* chunks start out all zero, so storing zero into a chunk that never held
+         * anything else changes nothing, and skipping it avoids touching the memory */
+        if (vprot || pages_vprot_dirty[chunk])
+        {
+            memset( pages_vprot[chunk] + (idx & pages_vprot_mask), vprot, count );
+            if (vprot) pages_vprot_dirty[chunk] = 1;
+        }
+        idx += count;
     }
-    memset( pages_vprot[idx >> pages_vprot_shift] + (idx & pages_vprot_mask), vprot, end - idx );
 #else
     memset( pages_vprot + idx, vprot, end - idx );
 #endif
@@ -930,10 +938,21 @@ static void set_page_vprot_bits( const void *addr, size_t size, BYTE set, BYTE c
     size_t end = ((size_t)addr + size + page_mask) >> page_shift;
 
 #ifdef _WIN64
-    for ( ; idx < end; idx++)
+    while (idx < end)
     {
-        BYTE *ptr = pages_vprot[idx >> pages_vprot_shift] + (idx & pages_vprot_mask);
-        *ptr = (*ptr & ~clear) | set;
+        size_t chunk = idx >> pages_vprot_shift;
+        size_t count = min( end - idx, pages_vprot_mask + 1 - (idx & pages_vprot_mask) );
+
+        /* clearing bits in a chunk that never held a non-zero byte is a no-op */
+        if (set || pages_vprot_dirty[chunk])
+        {
+            BYTE *ptr = pages_vprot[chunk] + (idx & pages_vprot_mask);
+            size_t i;
+
+            for (i = 0; i < count; i++) ptr[i] = (ptr[i] & ~clear) | set;
+            if (set) pages_vprot_dirty[chunk] = 1;
+        }
+        idx += count;
     }
 #else
     for ( ; idx < end; idx++) pages_vprot[idx] = (pages_vprot[idx] & ~clear) | set;
@@ -3295,6 +3314,8 @@ void virtual_init(void)
 #ifdef _WIN64
     pages_vprot_size = ((size_t)host_addr_space_limit >> page_shift >> pages_vprot_shift) + 1;
     pages_vprot = calloc( pages_vprot_size, sizeof(*pages_vprot) );
+    pages_vprot_dirty = calloc( pages_vprot_size, 1 );
+    assert( pages_vprot && pages_vprot_dirty );
 #else
     pages_vprot = anon_mmap_alloc( 1U << (32 - page_shift), PROT_READ | PROT_WRITE );
 #endif
