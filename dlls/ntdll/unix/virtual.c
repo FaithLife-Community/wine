@@ -3051,6 +3051,51 @@ static IMAGE_BASE_RELOCATION *process_relocation_block( char *page, IMAGE_BASE_R
 }
 
 
+/* Sections that are read-only and whose position in the image file isn't host page aligned
+ * can't be mmapped from the file, so every process would read them into its own private
+ * memory. For big sections the server keeps a page aligned copy in the image's shared temp
+ * file instead, so that all the processes mapping the image share the same pages.
+ * Keep in sync with is_shared_copy_section() in server/mapping.c */
+#define SHARED_COPY_MIN_SIZE 0x100000
+
+static BOOL is_shared_copy_section( const IMAGE_SECTION_HEADER *sec, SIZE_T file_start, SIZE_T file_size )
+{
+    if (sec->Characteristics & (IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_SHARED)) return FALSE;
+    if (!sec->PointerToRawData || file_size < SHARED_COPY_MIN_SIZE) return FALSE;
+    if (!(file_start & host_page_mask)) return FALSE;        /* can be mapped directly */
+    if (sec->VirtualAddress & host_page_mask) return FALSE;  /* can't be mapped on a host page boundary */
+    return TRUE;
+}
+
+/* offset in the shared file of the page aligned section copies: they follow the shared sections */
+static off_t get_shared_copy_base( const IMAGE_SECTION_HEADER *sec, unsigned int nb_sec, SIZE_T align_mask )
+{
+    off_t size = 0;
+    unsigned int i;
+
+    for (i = 0; i < nb_sec; i++)
+    {
+        if (!(sec[i].Characteristics & IMAGE_SCN_MEM_SHARED) ||
+            !(sec[i].Characteristics & IMAGE_SCN_MEM_WRITE)) continue;
+        if (!sec[i].Misc.VirtualSize) size += ROUND_SIZE( 0, sec[i].SizeOfRawData, align_mask );
+        else size += ROUND_SIZE( 0, sec[i].Misc.VirtualSize, align_mask );
+    }
+    return ROUND_SIZE( 0, size, host_page_mask );
+}
+
+/* map a section from its page aligned copy in the shared file */
+static BOOL map_shared_copy_section( struct file_view *view, int shared_fd, off_t *copy_pos,
+                                     const IMAGE_SECTION_HEADER *sec, SIZE_T file_size )
+{
+    off_t start = *copy_pos;
+
+    *copy_pos += ROUND_SIZE( 0, file_size, host_page_mask );
+    TRACE_(module)( "mapping section %.8s at %p from the shared copy at %#lx size %#lx\n",
+                    sec->Name, (char *)view->base + sec->VirtualAddress, (long)start, (long)file_size );
+    return map_file_into_view( view, shared_fd, sec->VirtualAddress, file_size, start,
+                               VPROT_COMMITTED | VPROT_READ | VPROT_WRITECOPY, FALSE ) == STATUS_SUCCESS;
+}
+
 /***********************************************************************
  *           map_image_into_view
  *
@@ -3067,7 +3112,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const WCHAR *filena
     IMAGE_DATA_DIRECTORY *imports, *dir;
     NTSTATUS status = STATUS_CONFLICTING_ADDRESSES;
     int i;
-    off_t pos;
+    off_t pos, copy_pos;
     struct stat st;
     char *header_end;
     char *ptr = view->base;
@@ -3132,6 +3177,8 @@ static NTSTATUS map_image_into_view( struct file_view *view, const WCHAR *filena
 
 
     /* map all the sections */
+
+    copy_pos = get_shared_copy_base( sec, nt->FileHeader.NumberOfSections, align_mask );
 
     for (i = pos = 0; i < nt->FileHeader.NumberOfSections; i++)
     {
@@ -3198,7 +3245,15 @@ static NTSTATUS map_image_into_view( struct file_view *view, const WCHAR *filena
          *       fall back to read(), so we don't need to check anything here.
          */
         end = file_start + file_size;
-        if (sec[i].PointerToRawData >= st.st_size ||
+        if (sec[i].PointerToRawData < st.st_size &&
+            end <= ((st.st_size + sector_align) & ~sector_align) &&
+            end >= file_start &&
+            shared_fd != -1 && is_shared_copy_section( &sec[i], file_start, file_size ) &&
+            map_shared_copy_section( view, shared_fd, &copy_pos, &sec[i], file_size ))
+        {
+            /* mapped from the page aligned shared copy */
+        }
+        else if (sec[i].PointerToRawData >= st.st_size ||
             end > ((st.st_size + sector_align) & ~sector_align) ||
             end < file_start ||
             map_file_into_view( view, fd, sec[i].VirtualAddress, file_size, file_start,

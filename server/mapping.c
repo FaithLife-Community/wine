@@ -613,6 +613,53 @@ static int find_committed_range( struct memory_view *view, file_pos_t start, mem
     return 0;
 }
 
+/* Sections that are read-only and whose position in the image file isn't host page aligned
+ * can't be mmapped from the file, so every process would read them into its own private
+ * memory. For big sections we keep a page aligned copy in the shared temp file instead, so
+ * that all the processes mapping the image share the same pages.
+ * Keep in sync with is_shared_copy_section() in dlls/ntdll/unix/virtual.c */
+#define SHARED_COPY_MIN_SIZE 0x100000
+
+static int is_shared_copy_section( const IMAGE_SECTION_HEADER *sec, size_t file_start, size_t file_size )
+{
+    if (sec->Characteristics & (IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_SHARED)) return 0;
+    if (!sec->PointerToRawData || file_size < SHARED_COPY_MIN_SIZE) return 0;
+    if (!(file_start & host_page_mask)) return 0;        /* can be mapped directly */
+    if (sec->VirtualAddress & host_page_mask) return 0;  /* can't be mapped on a host page boundary */
+    return 1;
+}
+
+/* copy a section from the image file to the shared temp file, in chunks */
+static int copy_to_shared_file( int fd, int shared_fd, off_t read_pos, size_t size, off_t write_pos )
+{
+    const size_t chunk_size = 0x100000;
+    char *buffer;
+    size_t done = 0;
+    int ret = 1;
+
+    if (!(buffer = malloc( chunk_size ))) return 0;
+    while (done < size)
+    {
+        size_t chunk = min( size - done, chunk_size );
+        ssize_t res = pread( fd, buffer, chunk, read_pos + done );
+
+        if (res <= 0)
+        {
+            if (!res && size - done < 0x200) break;  /* partial sector at EOF is not an error */
+            ret = 0;
+            break;
+        }
+        if (pwrite( shared_fd, buffer, res, write_pos + done ) != res)
+        {
+            ret = 0;
+            break;
+        }
+        done += res;
+    }
+    free( buffer );
+    return ret;
+}
+
 /* allocate and fill the temp file for a shared PE image mapping */
 static int build_shared_mapping( struct mapping *mapping, size_t align_mask, int fd,
                                  IMAGE_SECTION_HEADER *sec, unsigned int nb_sec )
@@ -622,7 +669,8 @@ static int build_shared_mapping( struct mapping *mapping, size_t align_mask, int
     unsigned int i;
     mem_size_t total_size;
     size_t file_size, map_size, max_size;
-    off_t shared_pos, read_pos, write_pos;
+    off_t shared_pos, read_pos, write_pos, copy_pos;
+    size_t copy_base, copy_size;
     char *buffer = NULL;
     int shared_fd;
     long toread;
@@ -640,6 +688,19 @@ static int build_shared_mapping( struct mapping *mapping, size_t align_mask, int
             total_size += map_size;
         }
     }
+
+    /* page aligned copies of big misaligned read-only sections go after the shared sections */
+
+    copy_base = round_size( total_size, host_page_mask );
+    copy_size = 0;
+    for (i = 0; i < nb_sec; i++)
+    {
+        get_section_sizes( &sec[i], align_mask, &map_size, &read_pos, &file_size );
+        if (is_shared_copy_section( &sec[i], read_pos, file_size ))
+            copy_size += round_size( file_size, host_page_mask );
+    }
+    if (copy_size) total_size = copy_base + copy_size;
+
     if (!total_size) return 1;  /* nothing to do */
 
     if ((mapping->shared = get_shared_file( mapping->fd ))) return 1;
@@ -649,15 +710,23 @@ static int build_shared_mapping( struct mapping *mapping, size_t align_mask, int
     if ((shared_fd = create_temp_file( total_size )) == -1) return 0;
     if (!(file = create_file_for_fd( shared_fd, FILE_GENERIC_READ|FILE_GENERIC_WRITE, 0 ))) return 0;
 
-    if (!(buffer = malloc( max_size ))) goto error;
+    if (!(buffer = malloc( max_size + 1 ))) goto error;
 
     /* copy the shared sections data into the temp file */
 
     shared_pos = 0;
+    copy_pos = copy_base;
     for (i = 0; i < nb_sec; i++)
     {
-        if (!(sec[i].Characteristics & IMAGE_SCN_MEM_SHARED)) continue;
-        if (!(sec[i].Characteristics & IMAGE_SCN_MEM_WRITE)) continue;
+        if (!(sec[i].Characteristics & IMAGE_SCN_MEM_SHARED) ||
+            !(sec[i].Characteristics & IMAGE_SCN_MEM_WRITE))
+        {
+            get_section_sizes( &sec[i], align_mask, &map_size, &read_pos, &file_size );
+            if (!is_shared_copy_section( &sec[i], read_pos, file_size )) continue;
+            if (!copy_to_shared_file( fd, shared_fd, read_pos, file_size, copy_pos )) goto error;
+            copy_pos += round_size( file_size, host_page_mask );
+            continue;
+        }
         get_section_sizes( &sec[i], align_mask, &map_size, &read_pos, &file_size );
         write_pos = shared_pos;
         shared_pos += map_size;
