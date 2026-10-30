@@ -3218,6 +3218,219 @@ static void test_CustomFontCollection(void)
     ok(ref == 0, "factory not released, %lu\n", ref);
 }
 
+struct filelist_key
+{
+    IDWriteFontFile *files[2];
+    unsigned int count;
+};
+
+struct filelist_enumerator
+{
+    IDWriteFontFileEnumerator IDWriteFontFileEnumerator_iface;
+    LONG ref;
+    struct filelist_key key;
+    unsigned int index;
+};
+
+static struct filelist_enumerator *impl_from_filelist_enumerator(IDWriteFontFileEnumerator *iface)
+{
+    return CONTAINING_RECORD(iface, struct filelist_enumerator, IDWriteFontFileEnumerator_iface);
+}
+
+static HRESULT WINAPI filelistenumerator_QueryInterface(IDWriteFontFileEnumerator *iface, REFIID riid, void **obj)
+{
+    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_IDWriteFontFileEnumerator))
+    {
+        *obj = iface;
+        IDWriteFontFileEnumerator_AddRef(iface);
+        return S_OK;
+    }
+    *obj = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI filelistenumerator_AddRef(IDWriteFontFileEnumerator *iface)
+{
+    struct filelist_enumerator *enumerator = impl_from_filelist_enumerator(iface);
+    return InterlockedIncrement(&enumerator->ref);
+}
+
+static ULONG WINAPI filelistenumerator_Release(IDWriteFontFileEnumerator *iface)
+{
+    struct filelist_enumerator *enumerator = impl_from_filelist_enumerator(iface);
+    ULONG ref = InterlockedDecrement(&enumerator->ref);
+    unsigned int i;
+
+    if (!ref)
+    {
+        for (i = 0; i < enumerator->key.count; ++i)
+            IDWriteFontFile_Release(enumerator->key.files[i]);
+        free(enumerator);
+    }
+    return ref;
+}
+
+static HRESULT WINAPI filelistenumerator_MoveNext(IDWriteFontFileEnumerator *iface, BOOL *current)
+{
+    struct filelist_enumerator *enumerator = impl_from_filelist_enumerator(iface);
+
+    *current = enumerator->index < enumerator->key.count;
+    if (*current)
+        enumerator->index++;
+    return S_OK;
+}
+
+static HRESULT WINAPI filelistenumerator_GetCurrentFontFile(IDWriteFontFileEnumerator *iface, IDWriteFontFile **file)
+{
+    struct filelist_enumerator *enumerator = impl_from_filelist_enumerator(iface);
+
+    *file = enumerator->key.files[enumerator->index - 1];
+    IDWriteFontFile_AddRef(*file);
+    return S_OK;
+}
+
+static const IDWriteFontFileEnumeratorVtbl filelistenumeratorvtbl =
+{
+    filelistenumerator_QueryInterface,
+    filelistenumerator_AddRef,
+    filelistenumerator_Release,
+    filelistenumerator_MoveNext,
+    filelistenumerator_GetCurrentFontFile,
+};
+
+static HRESULT WINAPI filelistloader_QueryInterface(IDWriteFontCollectionLoader *iface, REFIID riid, void **obj)
+{
+    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_IDWriteFontCollectionLoader))
+    {
+        *obj = iface;
+        IDWriteFontCollectionLoader_AddRef(iface);
+        return S_OK;
+    }
+    *obj = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI filelistloader_AddRef(IDWriteFontCollectionLoader *iface)
+{
+    return 2;
+}
+
+static ULONG WINAPI filelistloader_Release(IDWriteFontCollectionLoader *iface)
+{
+    return 1;
+}
+
+static HRESULT WINAPI filelistloader_CreateEnumeratorFromKey(IDWriteFontCollectionLoader *iface, IDWriteFactory *factory,
+        const void *key, UINT32 key_size, IDWriteFontFileEnumerator **ret)
+{
+    struct filelist_enumerator *enumerator;
+    unsigned int i;
+
+    ok(key_size == sizeof(struct filelist_key), "Unexpected key size %u.\n", key_size);
+
+    if (!(enumerator = calloc(1, sizeof(*enumerator))))
+        return E_OUTOFMEMORY;
+    enumerator->IDWriteFontFileEnumerator_iface.lpVtbl = &filelistenumeratorvtbl;
+    enumerator->ref = 1;
+    memcpy(&enumerator->key, key, sizeof(enumerator->key));
+    for (i = 0; i < enumerator->key.count; ++i)
+        IDWriteFontFile_AddRef(enumerator->key.files[i]);
+
+    *ret = &enumerator->IDWriteFontFileEnumerator_iface;
+    return S_OK;
+}
+
+static const IDWriteFontCollectionLoaderVtbl filelistloadervtbl =
+{
+    filelistloader_QueryInterface,
+    filelistloader_AddRef,
+    filelistloader_Release,
+    filelistloader_CreateEnumeratorFromKey,
+};
+
+static void test_CustomFontCollection_unsupported_file(void)
+{
+    IDWriteFontCollectionLoader filelist_loader = { &filelistloadervtbl };
+    static const char junk[] = "This is not a font file.";
+    WCHAR fontpathW[MAX_PATH], junkpathW[MAX_PATH];
+    IDWriteFontCollection *collection;
+    IDWriteFontFile *fontfile, *junkfile;
+    struct filelist_key key;
+    IDWriteFactory *factory;
+    UINT32 count, index;
+    DWORD written;
+    HANDLE file;
+    BOOL exists;
+    HRESULT hr;
+    ULONG ref;
+
+    factory = create_factory();
+
+    lstrcpyW(fontpathW, create_testfontfile(test_fontfile));
+
+    GetTempPathW(ARRAY_SIZE(junkpathW), junkpathW);
+    lstrcatW(junkpathW, L"wine_test_notafont.ttf");
+    file = CreateFileW(junkpathW, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, 0);
+    ok(file != INVALID_HANDLE_VALUE, "Failed to create %s, error %lu.\n", wine_dbgstr_w(junkpathW), GetLastError());
+    WriteFile(file, junk, sizeof(junk), &written, NULL);
+    CloseHandle(file);
+
+    hr = IDWriteFactory_CreateFontFileReference(factory, fontpathW, NULL, &fontfile);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = IDWriteFactory_CreateFontFileReference(factory, junkpathW, NULL, &junkfile);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+    hr = IDWriteFactory_RegisterFontCollectionLoader(factory, &filelist_loader);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+    /* Unsupported file before a valid one: the unsupported file is skipped. */
+    key.files[0] = junkfile;
+    key.files[1] = fontfile;
+    key.count = 2;
+    collection = NULL;
+    hr = IDWriteFactory_CreateCustomFontCollection(factory, &filelist_loader, &key, sizeof(key), &collection);
+    todo_wine
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        count = IDWriteFontCollection_GetFontFamilyCount(collection);
+        ok(count == 1, "Unexpected family count %u.\n", count);
+
+        exists = FALSE;
+        hr = IDWriteFontCollection_FindFamilyName(collection, L"wine_test", &index, &exists);
+        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+        ok(exists, "Expected family to exist.\n");
+
+        IDWriteFontCollection_Release(collection);
+    }
+
+    /* Only an unsupported file: an empty collection. */
+    key.files[0] = junkfile;
+    key.count = 1;
+    collection = NULL;
+    hr = IDWriteFactory_CreateCustomFontCollection(factory, &filelist_loader, &key, sizeof(key), &collection);
+    todo_wine
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        count = IDWriteFontCollection_GetFontFamilyCount(collection);
+        ok(count == 0, "Unexpected family count %u.\n", count);
+        IDWriteFontCollection_Release(collection);
+    }
+
+    hr = IDWriteFactory_UnregisterFontCollectionLoader(factory, &filelist_loader);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+    IDWriteFontFile_Release(junkfile);
+    IDWriteFontFile_Release(fontfile);
+
+    ref = IDWriteFactory_Release(factory);
+    ok(ref == 0, "factory not released, %lu\n", ref);
+
+    DELETE_FONTFILE(junkpathW);
+    DELETE_FONTFILE(fontpathW);
+}
+
 static HRESULT WINAPI fontfileloader_QueryInterface(IDWriteFontFileLoader *iface, REFIID riid, void **obj)
 {
     if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_IDWriteFontFileLoader))
@@ -10708,6 +10921,7 @@ START_TEST(font)
     test_system_fontcollection();
     test_ConvertFontFaceToLOGFONT();
     test_CustomFontCollection();
+    test_CustomFontCollection_unsupported_file();
     test_CreateCustomFontFileReference();
     test_CreateFontFileReference();
     test_shared_isolated();
