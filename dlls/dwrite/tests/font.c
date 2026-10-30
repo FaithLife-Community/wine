@@ -3389,7 +3389,6 @@ static void test_CustomFontCollection_unsupported_file(void)
     key.count = 2;
     collection = NULL;
     hr = IDWriteFactory_CreateCustomFontCollection(factory, &filelist_loader, &key, sizeof(key), &collection);
-    todo_wine
     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
     if (SUCCEEDED(hr))
     {
@@ -3409,7 +3408,6 @@ static void test_CustomFontCollection_unsupported_file(void)
     key.count = 1;
     collection = NULL;
     hr = IDWriteFactory_CreateCustomFontCollection(factory, &filelist_loader, &key, sizeof(key), &collection);
-    todo_wine
     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
     if (SUCCEEDED(hr))
     {
