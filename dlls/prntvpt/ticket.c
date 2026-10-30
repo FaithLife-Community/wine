@@ -653,11 +653,8 @@ fail:
 
 static void ticket_to_devmode(const struct ticket *ticket, DEVMODEW *dm)
 {
-    memset(dm, 0, sizeof(*dm));
-
-    dm->dmSize = sizeof(*dm);
-    dm->dmFields = DM_ORIENTATION | DM_PAPERSIZE | DM_PAPERLENGTH | DM_PAPERWIDTH | DM_SCALE |
-                   DM_COPIES | DM_DEFAULTSOURCE | DM_COLOR | DM_PRINTQUALITY | DM_YRESOLUTION | DM_COLLATE;
+    dm->dmFields |= DM_ORIENTATION | DM_PAPERSIZE | DM_PAPERLENGTH | DM_PAPERWIDTH | DM_SCALE |
+                    DM_COPIES | DM_DEFAULTSOURCE | DM_COLOR | DM_PRINTQUALITY | DM_YRESOLUTION | DM_COLLATE;
     dm->dmOrientation = ticket->page.orientation;
     dm->dmPaperSize = ticket->page.media.paper;
     dm->dmPaperWidth = ticket->page.media.size.width / 100;
@@ -669,6 +666,13 @@ static void ticket_to_devmode(const struct ticket *ticket, DEVMODEW *dm)
     dm->dmPrintQuality = ticket->page.resolution.x;
     dm->dmYResolution = ticket->page.resolution.y;
     dm->dmCollate = ticket->document.collate;
+
+    /* the form name may still describe the driver's previous paper size */
+    if (dm->dmSize >= FIELD_OFFSET(DEVMODEW, dmFormName) + sizeof(dm->dmFormName))
+    {
+        dm->dmFormName[0] = 0;
+        dm->dmFields &= ~DM_FORMNAME;
+    }
 }
 
 static void devmode_to_ticket(const DEVMODEW *dm, struct ticket *ticket)
@@ -727,6 +731,29 @@ static HRESULT initialize_ticket(struct prn_provider *prov, struct ticket *ticke
     return hr;
 }
 
+/* Return the driver's current DEVMODE, including its private part, so that
+ * callers can hand the result back to DocumentProperties() with the same buffer
+ * as input and output, like on Windows. Falls back to a public-only DEVMODE. */
+static DEVMODEW *get_driver_devmode(struct prn_provider *prov)
+{
+    DEVMODEW *dm;
+    LONG size;
+
+    size = DocumentPropertiesW(0, prov->hprn, prov->name, NULL, NULL, 0);
+    if (size >= (LONG)sizeof(DEVMODEW) && (dm = calloc(1, size)))
+    {
+        if (DocumentPropertiesW(0, prov->hprn, prov->name, dm, NULL, DM_OUT_BUFFER) > 0 &&
+            dm->dmSize >= sizeof(DEVMODEW) && dm->dmSize + dm->dmDriverExtra <= size)
+            return dm;
+        WARN("DocumentPropertiesW failed for %s\n", debugstr_w(prov->name));
+        free(dm);
+    }
+
+    if (!(dm = calloc(1, sizeof(*dm)))) return NULL;
+    dm->dmSize = sizeof(*dm);
+    return dm;
+}
+
 HRESULT WINAPI PTConvertPrintTicketToDevMode(HPTPROVIDER provider, IStream *stream, EDefaultDevmodeType type,
                                              EPrintTicketScope scope, ULONG *size, PDEVMODEW *dm, BSTR *error)
 {
@@ -745,11 +772,11 @@ HRESULT WINAPI PTConvertPrintTicketToDevMode(HPTPROVIDER provider, IStream *stre
     hr = parse_ticket(stream, scope, &ticket);
     if (hr != S_OK) return hr;
 
-    *dm = malloc(sizeof(**dm));
+    *dm = get_driver_devmode(prov);
     if (!*dm) return E_OUTOFMEMORY;
 
     ticket_to_devmode(&ticket, *dm);
-    *size = sizeof(**dm);
+    *size = (*dm)->dmSize + (*dm)->dmDriverExtra;
 
     return S_OK;
 }
