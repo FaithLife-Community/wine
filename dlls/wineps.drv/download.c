@@ -34,6 +34,7 @@
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(psdrv);
+WINE_DECLARE_DEBUG_CHANNEL(psdump);
 
 #define MS_MAKE_TAG( _x1, _x2, _x3, _x4 ) \
           ( ( (DWORD)_x4 << 24 ) |     \
@@ -859,6 +860,27 @@ static BOOL apply_gsub_subtable(DOWNLOAD *pdl, const struct gsub_data *gsub, WOR
     return changed;
 }
 
+/* DEBUG ONLY: dump a font table as hex so it can be analysed offline. */
+static void dump_font_table(HDC hdc, const char *font, DWORD tag)
+{
+    BYTE *data;
+    DWORD size, i, j;
+    char hex[129];
+
+    size = GetFontData(hdc, tag, 0, NULL, 0);
+    if (size == GDI_ERROR || !size || !(data = HeapAlloc(GetProcessHeap(), 0, size))) return;
+    if (GetFontData(hdc, tag, 0, data, size) == size)
+    {
+        TRACE_(psdump)("%s %.4s size %lu\n", font, (char *)&tag, size);
+        for (i = 0; i < size; i += 64)
+        {
+            for (j = 0; j < 64 && i + j < size; j++) sprintf(hex + j * 2, "%02x", data[i + j]);
+            TRACE_(psdump)("%s %.4s %08lx %s\n", font, (char *)&tag, i, hex);
+        }
+    }
+    HeapFree(GetProcessHeap(), 0, data);
+}
+
 static void init_glyph_text_from_gsub(HDC hdc, DOWNLOAD *pdl)
 {
     struct gsub_data gsub;
@@ -867,6 +889,19 @@ static void init_glyph_text_from_gsub(HDC hdc, DOWNLOAD *pdl)
     DWORD size;
     int pass, i, j;
     BOOL changed;
+
+    if (TRACE_ON(psdump))
+    {
+        static char dumped[16][64];
+        int k;
+        for (k = 0; k < 16 && dumped[k][0] && strcmp(dumped[k], pdl->ps_name); k++) ;
+        if (k < 16 && !dumped[k][0])
+        {
+            lstrcpynA(dumped[k], pdl->ps_name, sizeof(dumped[k]));
+            dump_font_table(hdc, pdl->ps_name, MS_MAKE_TAG('G','S','U','B'));
+            dump_font_table(hdc, pdl->ps_name, MS_MAKE_TAG('c','m','a','p'));
+        }
+    }
 
     size = GetFontData(hdc, MS_MAKE_TAG('G','S','U','B'), 0, NULL, 0);
     if (size == GDI_ERROR || size < 10) return;
