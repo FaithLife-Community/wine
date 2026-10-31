@@ -126,6 +126,61 @@ static void test_PTOpenProviderEx(void)
     }
 }
 
+static void test_PTConvertPrintTicketToDevMode(void)
+{
+    static const LARGE_INTEGER zero;
+    DEVMODEW *drv_dm, *dm;
+    HPTPROVIDER hprov;
+    IStream *stream;
+    HANDLE hprn;
+    ULONG dm_size;
+    LONG size;
+    HRESULT hr;
+
+    if (!OpenPrinterW(default_name, &hprn, NULL))
+    {
+        skip("can't open %s\n", wine_dbgstr_w(default_name));
+        return;
+    }
+    size = DocumentPropertiesW(0, hprn, default_name, NULL, NULL, 0);
+    ok(size >= (LONG)sizeof(DEVMODEW), "got %ld\n", size);
+    drv_dm = calloc(1, size);
+    size = DocumentPropertiesW(0, hprn, default_name, drv_dm, NULL, DM_OUT_BUFFER);
+    ok(size == IDOK, "got %ld\n", size);
+    trace("driver DEVMODE: dmSize %u, dmDriverExtra %u\n", drv_dm->dmSize, drv_dm->dmDriverExtra);
+
+    hr = PTOpenProvider(default_name, 1, &hprov);
+    ok(hr == S_OK, "got %#lx\n", hr);
+
+    hr = CreateStreamOnHGlobal(NULL, TRUE, &stream);
+    ok(hr == S_OK, "got %#lx\n", hr);
+    hr = PTConvertDevModeToPrintTicket(hprov, drv_dm->dmSize + drv_dm->dmDriverExtra, drv_dm, kPTJobScope, stream);
+    ok(hr == S_OK, "got %#lx\n", hr);
+    IStream_Seek(stream, zero, STREAM_SEEK_SET, NULL);
+
+    dm = NULL;
+    dm_size = 0;
+    hr = PTConvertPrintTicketToDevMode(hprov, stream, kUserDefaultDevmode, kPTJobScope, &dm_size, &dm, NULL);
+    ok(hr == S_OK, "got %#lx\n", hr);
+    if (hr == S_OK)
+    {
+        /* applications pass the result back to DocumentProperties() as both input
+         * and output buffer, so it has to include the driver's private data */
+        ok(dm_size == dm->dmSize + dm->dmDriverExtra, "got %lu, expected %u\n", dm_size, dm->dmSize + dm->dmDriverExtra);
+        ok(dm->dmDriverExtra == drv_dm->dmDriverExtra, "got %u, expected %u\n", dm->dmDriverExtra, drv_dm->dmDriverExtra);
+        ok(dm->dmPaperSize == drv_dm->dmPaperSize, "got %d, expected %d\n", dm->dmPaperSize, drv_dm->dmPaperSize);
+
+        size = DocumentPropertiesW(0, hprn, default_name, dm, dm, DM_IN_BUFFER | DM_OUT_BUFFER);
+        ok(size == IDOK, "got %ld\n", size);
+        PTReleaseMemory(dm);
+    }
+
+    IStream_Release(stream);
+    PTCloseProvider(hprov);
+    free(drv_dm);
+    ClosePrinter(hprn);
+}
+
 START_TEST(prntvpt)
 {
     DWORD size;
@@ -143,6 +198,7 @@ START_TEST(prntvpt)
 
     test_PTOpenProvider();
     test_PTOpenProviderEx();
+    test_PTConvertPrintTicketToDevMode();
 
     CoUninitialize();
 }
