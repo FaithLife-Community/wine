@@ -910,7 +910,9 @@ void PSDRV_WriteGlyphText(print_ctx *ctx, DOWNLOAD *pdl, WORD index, const char 
 
     if (!pdl || !pdl->glyph_text_count) return;
     if (index < pdl->glyph_to_unicode_count && pdl->glyph_to_unicode[index]) return;
-    if (!(len = get_glyph_text(pdl, index, text))) return;
+    /* Ghostscript drops GlyphNames2Unicode entries longer than one character for
+     * simple fonts; ligatures get an ActualText span instead. */
+    if ((len = get_glyph_text(pdl, index, text)) != 1) return;
 
     pos = snprintf(buf, sizeof(buf), fmt, pdl->ps_name, name);
     if (pos < 0 || pos + len * 4 + 8 > (int)sizeof(buf)) return;
@@ -918,6 +920,33 @@ void PSDRV_WriteGlyphText(print_ctx *ctx, DOWNLOAD *pdl, WORD index, const char 
         pos += sprintf(buf + pos, "%04X", text[i]);
     strcpy(buf + pos, "> put\n");
     PSDRV_WriteSpool(ctx, buf, strlen(buf));
+}
+
+/* Ligatures such as "Th" or "fi" stand for more than one character. Wrap them in a
+ * marked-content span carrying their text, which PDF converters such as Ghostscript
+ * turn into /ActualText; the prolog makes pdfmark a no-op on printers. */
+static int write_actual_text_begin(print_ctx *ctx, DOWNLOAD *pdl, WORD index)
+{
+    WCHAR text[MAX_GLYPH_TEXT + 1];
+    char buf[64 + MAX_GLYPH_TEXT * 4];
+    int len, i, pos;
+
+    if (!pdl->glyph_text_count) return 0;
+    if (index < pdl->glyph_to_unicode_count && pdl->glyph_to_unicode[index]) return 0;
+    if ((len = get_glyph_text(pdl, index, text)) < 2) return 0;
+
+    pos = sprintf(buf, "[/Span <</ActualText <FEFF");
+    for (i = 0; i < len; i++)
+        pos += sprintf(buf + pos, "%04X", text[i]);
+    strcpy(buf + pos, ">>> /BDC pdfmark\n");
+    PSDRV_WriteSpool(ctx, buf, strlen(buf));
+    return len;
+}
+
+static void write_actual_text_end(print_ctx *ctx)
+{
+    static const char emc[] = "[/EMC pdfmark\n";
+    PSDRV_WriteSpool(ctx, emc, sizeof(emc) - 1);
 }
 
 static BOOL get_unicode_glyph_name(HDC hdc, DOWNLOAD *pdl, WORD index, char *name)
@@ -1005,6 +1034,7 @@ BOOL PSDRV_WriteDownloadGlyphShow(print_ctx *ctx, const WORD *glyphs,
 				  UINT count)
 {
     UINT i;
+    int span;
     char g_name[MAX_G_NAME + 1];
     assert(ctx->font.fontloc == Download);
 
@@ -1013,7 +1043,9 @@ BOOL PSDRV_WriteDownloadGlyphShow(print_ctx *ctx, const WORD *glyphs,
     for(i = 0; i < count; i++) {
         get_glyph_name(ctx->hdc, ctx->font.fontinfo.Download, glyphs[i], g_name);
 	T42_download_glyph(ctx, ctx->font.fontinfo.Download, glyphs[i], g_name);
+        span = write_actual_text_begin(ctx, ctx->font.fontinfo.Download, glyphs[i]);
 	PSDRV_WriteGlyphShow(ctx, g_name);
+        if (span) write_actual_text_end(ctx);
     }
     break;
 
@@ -1021,7 +1053,9 @@ BOOL PSDRV_WriteDownloadGlyphShow(print_ctx *ctx, const WORD *glyphs,
     for(i = 0; i < count; i++) {
         get_glyph_name(ctx->hdc, ctx->font.fontinfo.Download, glyphs[i], g_name);
 	T1_download_glyph(ctx, ctx->font.fontinfo.Download, glyphs[i], g_name);
+        span = write_actual_text_begin(ctx, ctx->font.fontinfo.Download, glyphs[i]);
 	PSDRV_WriteGlyphShow(ctx, g_name);
+        if (span) write_actual_text_end(ctx);
     }
     break;
 
