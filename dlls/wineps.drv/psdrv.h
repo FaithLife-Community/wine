@@ -267,6 +267,13 @@ enum downloadtype {
   Type1, Type42
 };
 
+#define MAX_GLYPH_TEXT 8
+struct glyph_text
+{
+  WORD glyph;
+  WCHAR text[MAX_GLYPH_TEXT + 1];
+};
+
 typedef struct _tagDOWNLOAD {
   enum downloadtype type;
   union {
@@ -277,6 +284,8 @@ typedef struct _tagDOWNLOAD {
   WCHAR *glyph_to_unicode; /* for fonts without glyph names, built on first use */
   WORD glyph_to_unicode_count;
   BOOL glyph_to_unicode_done;
+  struct glyph_text *glyph_text; /* ligatures and alternates found through GSUB */
+  UINT glyph_text_count, glyph_text_size;
   struct _tagDOWNLOAD *next;
 } DOWNLOAD;
 
@@ -502,6 +511,7 @@ extern DWORD write_spool(print_ctx *ctx, const void *data, DWORD num);
 
 #define MAX_G_NAME 31 /* max length of PS glyph name */
 extern void get_glyph_name(HDC hdc, DOWNLOAD *pdl, WORD index, char *name);
+extern void PSDRV_WriteGlyphText(print_ctx *ctx, DOWNLOAD *pdl, WORD index, const char *name);
 
 extern TYPE1 *T1_download_header(print_ctx *ctx, char *ps_name,
                                  RECT *bbox, UINT emsize);

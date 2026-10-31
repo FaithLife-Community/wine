@@ -644,6 +644,8 @@ static void get_post2_custom_glyph_name(BYTE *post2header, DWORD size, WORD inde
     name[name_length] = 0;
 }
 
+static void init_glyph_text_from_gsub(HDC hdc, DOWNLOAD *pdl);
+
 /* Fonts with a format 3.0 'post' table carry no glyph names. Map glyph indices back
  * to characters through the font's cmap, so the glyphs can be given AGL "uniXXXX"
  * names; PostScript and PDF consumers use those to recover the text. */
@@ -687,6 +689,235 @@ static void init_glyph_to_unicode(HDC hdc, DOWNLOAD *pdl)
         }
     }
     HeapFree(GetProcessHeap(), 0, gs);
+    init_glyph_text_from_gsub(hdc, pdl);
+}
+
+
+/* GSUB: glyphs that are only reachable through substitutions (ligatures such as "Th",
+ * alternates, small caps) have no cmap entry. Work out the text they stand for from
+ * the glyphs they replace. */
+struct gsub_data
+{
+    const BYTE *data;
+    DWORD size;
+};
+
+static BOOL gsub_word(const struct gsub_data *gsub, DWORD offset, WORD *value)
+{
+    if (offset + 2 > gsub->size) return FALSE;
+    *value = GET_BE_WORD(gsub->data + offset);
+    return TRUE;
+}
+
+/* fills glyphs[] with the coverage table's glyphs, in coverage index order */
+static int coverage_glyphs(const struct gsub_data *gsub, DWORD offset, WORD *glyphs, int max)
+{
+    WORD format, count, start, end, i, g;
+    int n = 0;
+
+    if (!gsub_word(gsub, offset, &format) || !gsub_word(gsub, offset + 2, &count)) return 0;
+    if (format == 1)
+    {
+        for (i = 0; i < count && n < max; i++)
+            if (gsub_word(gsub, offset + 4 + i * 2, &glyphs[n])) n++;
+    }
+    else if (format == 2)
+    {
+        for (i = 0; i < count; i++)
+        {
+            if (!gsub_word(gsub, offset + 4 + i * 6, &start) || !gsub_word(gsub, offset + 6 + i * 6, &end))
+                break;
+            for (g = start; g <= end && n < max; g++)
+            {
+                glyphs[n++] = g;
+                if (g == 0xffff) break;
+            }
+        }
+    }
+    return n;
+}
+
+static int get_glyph_text(const DOWNLOAD *pdl, WORD glyph, WCHAR *text)
+{
+    UINT i;
+
+    if (glyph < pdl->glyph_to_unicode_count && pdl->glyph_to_unicode[glyph])
+    {
+        text[0] = pdl->glyph_to_unicode[glyph];
+        text[1] = 0;
+        return 1;
+    }
+    for (i = 0; i < pdl->glyph_text_count; i++)
+        if (pdl->glyph_text[i].glyph == glyph)
+        {
+            lstrcpyW(text, pdl->glyph_text[i].text);
+            return lstrlenW(text);
+        }
+    return 0;
+}
+
+static BOOL add_glyph_text(DOWNLOAD *pdl, WORD glyph, const WCHAR *text, int len)
+{
+    WCHAR dummy[MAX_GLYPH_TEXT + 1];
+    struct glyph_text *entry;
+
+    if (!len || len > MAX_GLYPH_TEXT || glyph >= pdl->glyph_to_unicode_count) return FALSE;
+    if (get_glyph_text(pdl, glyph, dummy)) return FALSE;
+
+    if (pdl->glyph_text_count == pdl->glyph_text_size)
+    {
+        UINT size = max(16, pdl->glyph_text_size * 2);
+        struct glyph_text *new_text;
+
+        if (pdl->glyph_text)
+            new_text = HeapReAlloc(GetProcessHeap(), 0, pdl->glyph_text, size * sizeof(*new_text));
+        else
+            new_text = HeapAlloc(GetProcessHeap(), 0, size * sizeof(*new_text));
+        if (!new_text) return FALSE;
+        pdl->glyph_text = new_text;
+        pdl->glyph_text_size = size;
+    }
+    entry = &pdl->glyph_text[pdl->glyph_text_count++];
+    entry->glyph = glyph;
+    memcpy(entry->text, text, len * sizeof(WCHAR));
+    entry->text[len] = 0;
+    return TRUE;
+}
+
+static BOOL apply_gsub_subtable(DOWNLOAD *pdl, const struct gsub_data *gsub, WORD type, DWORD offset,
+                                WORD *glyphs)
+{
+    WCHAR text[MAX_GLYPH_TEXT + 1], part[MAX_GLYPH_TEXT + 1];
+    WORD format, cov_offset, delta, count, set_offset, n_lig, lig_offset, lig_glyph, n_comp, g, sub;
+    int n, i, j, k, len, part_len;
+    BOOL changed = FALSE;
+
+    if (type == 7) /* extension */
+    {
+        WORD ext_type, hi, lo;
+
+        if (!gsub_word(gsub, offset + 2, &ext_type) || !gsub_word(gsub, offset + 4, &hi) ||
+            !gsub_word(gsub, offset + 6, &lo) || ext_type == 7)
+            return FALSE;
+        return apply_gsub_subtable(pdl, gsub, ext_type, offset + MAKELONG(lo, hi), glyphs);
+    }
+    if (type != 1 && type != 3 && type != 4) return FALSE;
+    if (!gsub_word(gsub, offset, &format) || !gsub_word(gsub, offset + 2, &cov_offset)) return FALSE;
+    n = coverage_glyphs(gsub, offset + cov_offset, glyphs, 0x10000);
+
+    for (i = 0; i < n; i++)
+    {
+        if (!(len = get_glyph_text(pdl, glyphs[i], text))) continue;
+
+        if (type == 1 && format == 1)
+        {
+            if (gsub_word(gsub, offset + 4, &delta))
+                changed |= add_glyph_text(pdl, (WORD)(glyphs[i] + delta), text, len);
+        }
+        else if (type == 1 && format == 2)
+        {
+            if (gsub_word(gsub, offset + 6 + i * 2, &sub))
+                changed |= add_glyph_text(pdl, sub, text, len);
+        }
+        else if (type == 3 && format == 1)
+        {
+            if (!gsub_word(gsub, offset + 6 + i * 2, &set_offset) ||
+                !gsub_word(gsub, offset + set_offset, &count)) continue;
+            for (j = 0; j < count; j++)
+                if (gsub_word(gsub, offset + set_offset + 2 + j * 2, &sub))
+                    changed |= add_glyph_text(pdl, sub, text, len);
+        }
+        else if (type == 4 && format == 1)
+        {
+            DWORD set;
+
+            if (!gsub_word(gsub, offset + 6 + i * 2, &set_offset)) continue;
+            set = offset + set_offset;
+            if (!gsub_word(gsub, set, &n_lig)) continue;
+            for (j = 0; j < n_lig; j++)
+            {
+                int total = len;
+                WCHAR lig[MAX_GLYPH_TEXT + 1];
+
+                if (!gsub_word(gsub, set + 2 + j * 2, &lig_offset) ||
+                    !gsub_word(gsub, set + lig_offset, &lig_glyph) ||
+                    !gsub_word(gsub, set + lig_offset + 2, &n_comp)) continue;
+                memcpy(lig, text, len * sizeof(WCHAR));
+                for (k = 1; k < n_comp; k++)
+                {
+                    if (!gsub_word(gsub, set + lig_offset + 2 + k * 2, &g) ||
+                        !(part_len = get_glyph_text(pdl, g, part)) || total + part_len > MAX_GLYPH_TEXT)
+                        break;
+                    memcpy(lig + total, part, part_len * sizeof(WCHAR));
+                    total += part_len;
+                }
+                if (k == n_comp)
+                    changed |= add_glyph_text(pdl, lig_glyph, lig, total);
+            }
+        }
+    }
+    return changed;
+}
+
+static void init_glyph_text_from_gsub(HDC hdc, DOWNLOAD *pdl)
+{
+    struct gsub_data gsub;
+    WORD list, n_lookups, lookup, type, n_sub, sub, *glyphs = NULL;
+    BYTE *data;
+    DWORD size;
+    int pass, i, j;
+    BOOL changed;
+
+    size = GetFontData(hdc, MS_MAKE_TAG('G','S','U','B'), 0, NULL, 0);
+    if (size == GDI_ERROR || size < 10) return;
+    if (!(data = HeapAlloc(GetProcessHeap(), 0, size))) return;
+    if (GetFontData(hdc, MS_MAKE_TAG('G','S','U','B'), 0, data, size) != size) goto done;
+    gsub.data = data;
+    gsub.size = size;
+
+    if (!gsub_word(&gsub, 8, &list) || !gsub_word(&gsub, list, &n_lookups)) goto done;
+    if (!(glyphs = HeapAlloc(GetProcessHeap(), 0, 0x10000 * sizeof(*glyphs)))) goto done;
+
+    /* substitutions can build on each other (an alternate of a ligature) */
+    for (pass = 0, changed = TRUE; changed && pass < 3; pass++)
+    {
+        changed = FALSE;
+        for (i = 0; i < n_lookups; i++)
+        {
+            if (!gsub_word(&gsub, list + 2 + i * 2, &lookup) ||
+                !gsub_word(&gsub, list + lookup, &type) ||
+                !gsub_word(&gsub, list + lookup + 4, &n_sub)) continue;
+            for (j = 0; j < n_sub; j++)
+                if (gsub_word(&gsub, list + lookup + 6 + j * 2, &sub))
+                    changed |= apply_gsub_subtable(pdl, &gsub, type, list + lookup + sub, glyphs);
+        }
+    }
+    TRACE("%u glyphs mapped through GSUB\n", pdl->glyph_text_count);
+done:
+    HeapFree(GetProcessHeap(), 0, glyphs);
+    HeapFree(GetProcessHeap(), 0, data);
+}
+
+/* Glyphs found through GSUB keep their g<index> name, which is unique; tell consumers
+ * such as Ghostscript what they stand for through the font's GlyphNames2Unicode
+ * dictionary, as Windows' PostScript driver does. */
+void PSDRV_WriteGlyphText(print_ctx *ctx, DOWNLOAD *pdl, WORD index, const char *name)
+{
+    static const char fmt[] = "/%s findfont /FontInfo get /GlyphNames2Unicode get /%s <";
+    WCHAR text[MAX_GLYPH_TEXT + 1];
+    char buf[512];
+    int len, i, pos;
+
+    if (!pdl || !pdl->glyph_text_count) return;
+    if (index < pdl->glyph_to_unicode_count && pdl->glyph_to_unicode[index]) return;
+    if (!(len = get_glyph_text(pdl, index, text))) return;
+
+    pos = snprintf(buf, sizeof(buf), fmt, pdl->ps_name, name);
+    if (pos < 0 || pos + len * 4 + 8 > (int)sizeof(buf)) return;
+    for (i = 0; i < len; i++)
+        pos += sprintf(buf + pos, "%04X", text[i]);
+    strcpy(buf + pos, "> put\n");
+    PSDRV_WriteSpool(ctx, buf, strlen(buf));
 }
 
 static BOOL get_unicode_glyph_name(HDC hdc, DOWNLOAD *pdl, WORD index, char *name)
@@ -844,6 +1075,7 @@ BOOL PSDRV_EmptyDownloadList(print_ctx *ctx, BOOL write_undef)
 
 	HeapFree(GetProcessHeap(), 0, pdl->ps_name);
 	HeapFree(GetProcessHeap(), 0, pdl->glyph_to_unicode);
+	HeapFree(GetProcessHeap(), 0, pdl->glyph_text);
 	old = pdl;
 	pdl = pdl->next;
 	HeapFree(GetProcessHeap(), 0, old);
