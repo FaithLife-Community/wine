@@ -320,7 +320,7 @@ BOOL PSDRV_WriteSetDownloadFont(print_ctx *ctx, BOOL vertical)
 
         if(pdl->type == Type42) {
             char g_name[MAX_G_NAME + 1];
-            get_glyph_name(ctx->hdc, 0, g_name);
+            get_glyph_name(ctx->hdc, pdl, 0, g_name);
             T42_download_glyph(ctx, pdl, 0, g_name);
         }
     }
@@ -644,7 +644,61 @@ static void get_post2_custom_glyph_name(BYTE *post2header, DWORD size, WORD inde
     name[name_length] = 0;
 }
 
-void get_glyph_name(HDC hdc, WORD index, char *name)
+/* Fonts with a format 3.0 'post' table carry no glyph names. Map glyph indices back
+ * to characters through the font's cmap, so the glyphs can be given AGL "uniXXXX"
+ * names; PostScript and PDF consumers use those to recover the text. */
+static void init_glyph_to_unicode(HDC hdc, DOWNLOAD *pdl)
+{
+    WCHAR chars[256];
+    WORD glyphs[256], num_glyphs;
+    GLYPHSET *gs;
+    DWORD size, i, j, k, n;
+
+    pdl->glyph_to_unicode_done = TRUE;
+
+    if (GetFontData(hdc, MS_MAKE_TAG('m','a','x','p'), 4, &num_glyphs, sizeof(num_glyphs)) != sizeof(num_glyphs))
+        return;
+    num_glyphs = GET_BE_WORD(&num_glyphs);
+    if (!num_glyphs || !(size = GetFontUnicodeRanges(hdc, NULL))) return;
+    if (!(gs = HeapAlloc(GetProcessHeap(), 0, size))) return;
+    if (!(pdl->glyph_to_unicode = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                            num_glyphs * sizeof(*pdl->glyph_to_unicode))))
+    {
+        HeapFree(GetProcessHeap(), 0, gs);
+        return;
+    }
+    pdl->glyph_to_unicode_count = num_glyphs;
+
+    GetFontUnicodeRanges(hdc, gs);
+    for (i = 0; i < gs->cRanges; i++)
+    {
+        for (j = 0; j < gs->ranges[i].cGlyphs; j += n)
+        {
+            n = min(ARRAY_SIZE(chars), gs->ranges[i].cGlyphs - j);
+            for (k = 0; k < n; k++) chars[k] = gs->ranges[i].wcLow + j + k;
+            if (GetGlyphIndicesW(hdc, chars, n, glyphs, GGI_MARK_NONEXISTING_GLYPHS) == GDI_ERROR)
+                continue;
+            for (k = 0; k < n; k++)
+            {
+                /* keep the lowest code point when several map to the same glyph */
+                if (glyphs[k] && glyphs[k] < num_glyphs && !pdl->glyph_to_unicode[glyphs[k]])
+                    pdl->glyph_to_unicode[glyphs[k]] = chars[k];
+            }
+        }
+    }
+    HeapFree(GetProcessHeap(), 0, gs);
+}
+
+static BOOL get_unicode_glyph_name(HDC hdc, DOWNLOAD *pdl, WORD index, char *name)
+{
+    if (!pdl) return FALSE;
+    if (!pdl->glyph_to_unicode_done) init_glyph_to_unicode(hdc, pdl);
+    if (index >= pdl->glyph_to_unicode_count || !pdl->glyph_to_unicode[index]) return FALSE;
+    snprintf(name, MAX_G_NAME + 1, "uni%04X", pdl->glyph_to_unicode[index]);
+    return TRUE;
+}
+
+void get_glyph_name(HDC hdc, DOWNLOAD *pdl, WORD index, char *name)
 {
     struct
     {
@@ -702,8 +756,8 @@ void get_glyph_name(HDC hdc, WORD index, char *name)
         else
             get_post2_custom_glyph_name(post2header, size, glyphNameIndex - 258, name);
     }
-    else
-        FIXME("PostScript Format %d.%d glyph names are currently unsupported.\n",
+    else if(!get_unicode_glyph_name(hdc, pdl, index, name))
+        TRACE("No name for glyph %d in a PostScript Format %d.%d font\n", index,
               HIWORD(post_header->format), LOWORD(post_header->format));
 
 cleanup:
@@ -726,7 +780,7 @@ BOOL PSDRV_WriteDownloadGlyphShow(print_ctx *ctx, const WORD *glyphs,
     switch(ctx->font.fontinfo.Download->type) {
     case Type42:
     for(i = 0; i < count; i++) {
-        get_glyph_name(ctx->hdc, glyphs[i], g_name);
+        get_glyph_name(ctx->hdc, ctx->font.fontinfo.Download, glyphs[i], g_name);
 	T42_download_glyph(ctx, ctx->font.fontinfo.Download, glyphs[i], g_name);
 	PSDRV_WriteGlyphShow(ctx, g_name);
     }
@@ -734,7 +788,7 @@ BOOL PSDRV_WriteDownloadGlyphShow(print_ctx *ctx, const WORD *glyphs,
 
     case Type1:
     for(i = 0; i < count; i++) {
-        get_glyph_name(ctx->hdc, glyphs[i], g_name);
+        get_glyph_name(ctx->hdc, ctx->font.fontinfo.Download, glyphs[i], g_name);
 	T1_download_glyph(ctx, ctx->font.fontinfo.Download, glyphs[i], g_name);
 	PSDRV_WriteGlyphShow(ctx, g_name);
     }
@@ -789,6 +843,7 @@ BOOL PSDRV_EmptyDownloadList(print_ctx *ctx, BOOL write_undef)
 	}
 
 	HeapFree(GetProcessHeap(), 0, pdl->ps_name);
+	HeapFree(GetProcessHeap(), 0, pdl->glyph_to_unicode);
 	old = pdl;
 	pdl = pdl->next;
 	HeapFree(GetProcessHeap(), 0, old);
