@@ -77,7 +77,8 @@ static const char psprolog[] =
 "} bind def\n"
 "/B {pop pop pop pop} def\n"
 "/N {newpath} def\n"
-"/havetype42gdir {version cvi 2015 ge} bind def\n";
+"/havetype42gdir {version cvi 2015 ge} bind def\n"
+"/pdfmark where {pop} {userdict /pdfmark /cleartomark load put} ifelse\n";
 
 static const char psbeginsetup[] =
 "%%BeginSetup\n";
