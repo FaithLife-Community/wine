@@ -274,6 +274,9 @@ typedef struct _tagDOWNLOAD {
     TYPE42 *Type42;
   } typeinfo;
   char *ps_name;
+  WCHAR *glyph_to_unicode; /* for fonts without glyph names, built on first use */
+  WORD glyph_to_unicode_count;
+  BOOL glyph_to_unicode_done;
   struct _tagDOWNLOAD *next;
 } DOWNLOAD;
 
@@ -498,7 +501,7 @@ extern BOOL flush_spool(print_ctx *ctx);
 extern DWORD write_spool(print_ctx *ctx, const void *data, DWORD num);
 
 #define MAX_G_NAME 31 /* max length of PS glyph name */
-extern void get_glyph_name(HDC hdc, WORD index, char *name);
+extern void get_glyph_name(HDC hdc, DOWNLOAD *pdl, WORD index, char *name);
 
 extern TYPE1 *T1_download_header(print_ctx *ctx, char *ps_name,
                                  RECT *bbox, UINT emsize);
