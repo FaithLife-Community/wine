@@ -80,6 +80,7 @@ TYPE1 *T1_download_header(print_ctx *ctx, char *ps_name, RECT *bbox, UINT emsize
       " /FontMatrix [1 %ld div 0 0 1 %ld div 0 0] def\n"
       " /FontBBox [%ld %ld %ld %ld] def\n"
       " /FontType 1 def\n"
+      " /FontInfo 1 dict dup /GlyphNames2Unicode 16 dict put def\n"
       " /Private 7 dict begin\n"
       "  /RD {string currentfile exch readhexstring pop} def\n"
       "  /ND {def} def\n"
@@ -658,6 +659,7 @@ BOOL T1_download_glyph(print_ctx *ctx, DOWNLOAD *pdl, DWORD index, char *glyph_n
     PSDRV_WriteBytes(ctx, bytes, len);
     sprintf(buf, glyph_def_end);
     PSDRV_WriteSpool(ctx, buf, strlen(buf));
+    PSDRV_WriteGlyphText(ctx, pdl, index, glyph_name);
     str_free(charstring);
 
     t1->glyph_sent[index] = TRUE;

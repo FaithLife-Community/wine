@@ -152,6 +152,7 @@ TYPE42 *T42_download_header(print_ctx *ctx, char *ps_name,
 	    " /FontMatrix [1 0 0 1 0 0] def\n"
 	    " /FontBBox [%f %f %f %f] def\n"
 	    " /FontType 42 def\n"
+	    " /FontInfo 1 dict dup /GlyphNames2Unicode 16 dict put def\n"
 	    " /CharStrings 256 dict begin\n"
 	    "  /.notdef 0 def\n"
             " currentdict end def\n"
@@ -363,6 +364,7 @@ BOOL T42_download_glyph(print_ctx *ctx, DOWNLOAD *pdl, DWORD index,
     PSDRV_WriteSpool(ctx, ">\n", 2);
     sprintf(buf, glyph_def, pdl->ps_name, index, glyph_name, index);
     PSDRV_WriteSpool(ctx, buf, strlen(buf));
+    PSDRV_WriteGlyphText(ctx, pdl, index, glyph_name);
 
     t42->glyph_sent[index] = TRUE;
     HeapFree(GetProcessHeap(), 0, buf);
