@@ -1959,6 +1959,18 @@ static HRESULT WINAPI d3d9_device_GetRenderTargetData(IDirect3DDevice9Ex *iface,
         hr = wined3d_device_context_blt(device->immediate_context,
                 dst_impl->wined3d_texture, dst_impl->sub_resource_idx, &dst_rect,
                 rt_impl->wined3d_texture, rt_impl->sub_resource_idx, &src_rect, 0, NULL, WINED3D_TEXF_POINT);
+
+    /* The data has to be in system memory when GetRenderTargetData() returns:
+     * applications may read a user memory surface directly afterwards,
+     * without locking it first. */
+    if (SUCCEEDED(hr))
+    {
+        struct wined3d_resource *dst_resource = wined3d_texture_get_resource(dst_impl->wined3d_texture);
+        struct wined3d_map_desc map_desc;
+
+        if (SUCCEEDED(wined3d_resource_map(dst_resource, dst_impl->sub_resource_idx, &map_desc, NULL, WINED3D_MAP_READ)))
+            wined3d_resource_unmap(dst_resource, dst_impl->sub_resource_idx);
+    }
     wined3d_mutex_unlock();
 
     return hr;
