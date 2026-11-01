@@ -75,6 +75,7 @@ typedef enum
 #define GNUTLS_CIPHER_AES_256_CFB8 31
 
 #define GNUTLS_PK_RSA_PSS 6
+#define GNUTLS_PK_ECDH_X25519 GNUTLS_PK_ECDHX
 #define GNUTLS_PRIVKEY_SIGN_FLAG_RSA_PSS (1 << 7)
 typedef struct gnutls_x509_spki_st *gnutls_x509_spki_t;
 #endif
