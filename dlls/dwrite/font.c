@@ -4709,8 +4709,14 @@ HRESULT create_font_collection(IDWriteFactory7 *factory, IDWriteFontFileEnumerat
         fileenum->file = file;
         list_add_tail(&scannedfiles, &fileenum->entry);
 
+        /* Unsupported or unreadable files are skipped. */
         if (FAILED(hr = IDWriteFontSetBuilder1_AddFontFile(builder, file)))
-            break;
+        {
+            if (hr == E_OUTOFMEMORY)
+                break;
+            WARN("Skipping font file %p, hr %#lx.\n", file, hr);
+            hr = S_OK;
+        }
     }
 
     if (SUCCEEDED(hr))
