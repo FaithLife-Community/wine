@@ -1121,20 +1121,51 @@ static HRESULT WINAPI video_mixer_transform_ProcessEvent(IMFTransform *iface, DW
     return E_NOTIMPL;
 }
 
-static void video_mixer_request_sample(struct video_mixer *mixer, unsigned int idx)
+/* Marks an input as requested, called with the mixer lock held. The request
+ * itself is sent by video_mixer_send_requests() after the lock is released:
+ * the renderer takes its own lock in Notify(), and calls into the mixer with
+ * that lock held (e.g. on clock start), so notifying with the mixer lock held
+ * can deadlock. */
+static void video_mixer_request_sample(struct video_mixer *mixer, unsigned int idx, unsigned int *requests)
 {
     if (!mixer->event_sink || mixer->inputs[idx].sample_requested)
         return;
 
-    IMediaEventSink_Notify(mixer->event_sink, EC_SAMPLE_NEEDED, idx, 0);
     mixer->inputs[idx].sample_requested = 1;
+    *requests |= 1u << idx;
+}
+
+/* Takes a reference to the event sink if there are requests to send; called
+ * with the mixer lock held. */
+static IMediaEventSink *video_mixer_get_request_sink(struct video_mixer *mixer, unsigned int requests)
+{
+    if (!requests || !mixer->event_sink)
+        return NULL;
+    IMediaEventSink_AddRef(mixer->event_sink);
+    return mixer->event_sink;
+}
+
+/* Called without the mixer lock. */
+static void video_mixer_send_requests(IMediaEventSink *sink, unsigned int requests)
+{
+    unsigned int i;
+
+    if (!sink)
+        return;
+    for (i = 0; requests; ++i, requests >>= 1)
+    {
+        if (requests & 1)
+            IMediaEventSink_Notify(sink, EC_SAMPLE_NEEDED, i, 0);
+    }
+    IMediaEventSink_Release(sink);
 }
 
 static HRESULT WINAPI video_mixer_transform_ProcessMessage(IMFTransform *iface, MFT_MESSAGE_TYPE message, ULONG_PTR param)
 {
     struct video_mixer *mixer = impl_from_IMFTransform(iface);
+    unsigned int i, requests = 0;
+    IMediaEventSink *request_sink;
     HRESULT hr = S_OK;
-    unsigned int i;
 
     TRACE("%p, %#x, %Iu.\n", iface, message, param);
 
@@ -1161,7 +1192,7 @@ static HRESULT WINAPI video_mixer_transform_ProcessMessage(IMFTransform *iface, 
             else
             {
                 for (i = 0; i < mixer->input_count; ++i)
-                    video_mixer_request_sample(mixer, i);
+                    video_mixer_request_sample(mixer, i, &requests);
             }
 
             mixer->is_streaming = message == MFT_MESSAGE_NOTIFY_BEGIN_STREAMING;
@@ -1176,7 +1207,9 @@ static HRESULT WINAPI video_mixer_transform_ProcessMessage(IMFTransform *iface, 
             hr = E_NOTIMPL;
     }
 
+    request_sink = video_mixer_get_request_sink(mixer, requests);
     LeaveCriticalSection(&mixer->cs);
+    video_mixer_send_requests(request_sink, requests);
 
     return hr;
 }
@@ -1400,10 +1433,11 @@ static HRESULT WINAPI video_mixer_transform_ProcessOutput(IMFTransform *iface, D
 {
     struct video_mixer *mixer = impl_from_IMFTransform(iface);
     LONGLONG timestamp, duration;
+    unsigned int i, requests = 0;
+    IMediaEventSink *request_sink;
     IDirect3DSurface9 *surface;
     IDirect3DDevice9 *device;
     BOOL repaint = FALSE;
-    unsigned int i;
     HRESULT hr;
 
     TRACE("%p, %#lx, %lu, %p, %p.\n", iface, flags, count, buffers, status);
@@ -1459,7 +1493,7 @@ static HRESULT WINAPI video_mixer_transform_ProcessOutput(IMFTransform *iface, D
             if ((SUCCEEDED(hr) && !repaint) || hr == MF_E_TRANSFORM_NEED_MORE_INPUT)
             {
                 for (i = 0; i < mixer->input_count; ++i)
-                    video_mixer_request_sample(mixer, i);
+                    video_mixer_request_sample(mixer, i, &requests);
             }
         }
         else
@@ -1479,7 +1513,9 @@ static HRESULT WINAPI video_mixer_transform_ProcessOutput(IMFTransform *iface, D
         IDirect3DSurface9_Release(surface);
     }
 
+    request_sink = video_mixer_get_request_sink(mixer, requests);
     LeaveCriticalSection(&mixer->cs);
+    video_mixer_send_requests(request_sink, requests);
 
     return hr;
 }
