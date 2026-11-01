@@ -1450,7 +1450,13 @@ static HRESULT WINAPI video_mixer_transform_ProcessOutput(IMFTransform *iface, D
                 mixer->output_rendered = 1;
             }
 
-            if (SUCCEEDED(hr) && !repaint)
+            /* Ask for new input after a normal render, and also whenever we have
+             * nothing new to render: a repaint (e.g. after the presenter changed
+             * the output type on a resize) may have rendered the latest input
+             * without requesting more, and after a flush (seek) the inputs are
+             * empty. Without a request the EVR sends no more samples and the
+             * picture freezes. */
+            if ((SUCCEEDED(hr) && !repaint) || hr == MF_E_TRANSFORM_NEED_MORE_INPUT)
             {
                 for (i = 0; i < mixer->input_count; ++i)
                     video_mixer_request_sample(mixer, i);
