@@ -2336,7 +2336,11 @@ static void wined3d_context_gl_get_rt_size(const struct wined3d_context_gl *cont
     const struct wined3d_texture *rt = context_gl->c.current_rt.texture;
     unsigned int level;
 
-    if (rt->swapchain)
+    /* The window size only matters when drawing to the window itself. When a
+     * swapchain texture is drawn to through an FBO, the window may be much
+     * smaller than the texture (or even zero-sized, or a message-only window),
+     * and using its size would clip the draw. */
+    if (rt->swapchain && !context_gl->current_fbo)
     {
         const struct wined3d_swapchain_desc *desc = &rt->swapchain->state.desc;
 
