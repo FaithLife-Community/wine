@@ -1293,18 +1293,25 @@ static void context_restore_gl_context(const struct wined3d_gl_info *gl_info, HD
 
 static void wined3d_context_gl_update_window(struct wined3d_context_gl *context_gl)
 {
+    HDC dc;
+
     if (!context_gl->c.swapchain)
         return;
 
-    if (context_gl->window == context_gl->c.swapchain->win_handle &&
-        context_gl->dc == context_gl->c.swapchain->dc)
+    dc = wined3d_swapchain_get_dc(context_gl->c.swapchain);
+    if (context_gl->window == context_gl->c.swapchain->win_handle && context_gl->dc == dc)
+        return;
+
+    /* Keep using the backup DC we already fell back to when the swapchain has
+     * no DC for its window any more. */
+    if (!dc && context_gl->dc_is_private && context_gl->window == context_gl->c.swapchain->win_handle)
         return;
 
     TRACE("Updating context %p window from %p to %p.\n",
             context_gl, context_gl->window, context_gl->c.swapchain->win_handle);
 
     context_gl->window = context_gl->c.swapchain->win_handle;
-    context_gl->dc = context_gl->c.swapchain->dc;
+    context_gl->dc = dc;
     context_gl->dc_is_private = FALSE;
     context_gl->dc_has_format = FALSE;
     context_gl->needs_set = 1;
@@ -2002,7 +2009,7 @@ HRESULT wined3d_context_gl_init(struct wined3d_context_gl *context_gl, struct wi
         TRACE("Swapchain is created on the desktop window, trying backup device context.\n");
         context_gl->dc = NULL;
     }
-    else if (!(context_gl->dc = swapchain_gl->s.dc))
+    else if (!(context_gl->dc = wined3d_swapchain_get_dc(&swapchain_gl->s)))
         WARN("Failed to retrieve device context, trying swapchain backup.\n");
 
     if (!context_gl->dc)

@@ -4132,6 +4132,7 @@ struct wined3d_swapchain
 };
 
 void wined3d_swapchain_activate(struct wined3d_swapchain *swapchain, BOOL activate);
+HDC wined3d_swapchain_get_dc(struct wined3d_swapchain *swapchain);
 void wined3d_swapchain_cleanup(struct wined3d_swapchain *swapchain);
 struct wined3d_output * wined3d_swapchain_get_output(const struct wined3d_swapchain *swapchain);
 void swapchain_update_draw_bindings(struct wined3d_swapchain *swapchain);
