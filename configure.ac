@@ -1082,7 +1082,8 @@ case $host_os in
         AS_VAR_APPEND([WINELOADER_LDFLAGS],[" -pie"])
         case $HOST_ARCH in
           i386|arm)
-            AS_VAR_APPEND([WINEPRELOADER_LDFLAGS],[" -static -Wl,-Ttext=0x7d400000"]) ;;
+            AS_VAR_APPEND([WINEPRELOADER_LDFLAGS],[" -static -Wl,-Ttext=0x7d400000"])
+            WINE_TRY_CFLAGS([-Wl,--no-rosegment],[AS_VAR_APPEND([WINEPRELOADER_LDFLAGS],[" -Wl,--no-rosegment"])]) ;;
           *)
             WINE_TRY_CFLAGS([-static-pie],
                             [AS_VAR_APPEND([WINEPRELOADER_LDFLAGS],[" -static-pie"])],
@@ -1095,8 +1096,7 @@ case $host_os in
                   *)
                     AS_VAR_APPEND([WINEPRELOADER_LDFLAGS],[" -static -Wl,-Ttext=0x7d7d00000000"]) ;;
                 esac
-            ])
-            ;;
+                WINE_TRY_CFLAGS([-Wl,--no-rosegment],[AS_VAR_APPEND([WINEPRELOADER_LDFLAGS],[" -Wl,--no-rosegment"])])]) ;;
         esac
         ;;
       *)
@@ -2448,6 +2448,8 @@ WINE_CONFIG_MAKEFILE(dlls/browseui/tests)
 WINE_CONFIG_MAKEFILE(dlls/bthprops.cpl)
 WINE_CONFIG_MAKEFILE(dlls/cabinet)
 WINE_CONFIG_MAKEFILE(dlls/cabinet/tests)
+WINE_CONFIG_MAKEFILE(dlls/capabilityaccessmanagerclient)
+WINE_CONFIG_MAKEFILE(dlls/capabilityaccessmanagerclient/tests)
 WINE_CONFIG_MAKEFILE(dlls/capi2032)
 WINE_CONFIG_MAKEFILE(dlls/cards)
 WINE_CONFIG_MAKEFILE(dlls/cdosys)
