@@ -1240,8 +1240,26 @@ static BOOL X11DRV_PropertyNotify( HWND hwnd, XEvent *xev )
  */
 void X11DRV_ActivateWindow( HWND hwnd, HWND previous )
 {
+    DWORD ex_style = NtUserGetWindowLongW( hwnd, GWL_EXSTYLE );
     struct x11drv_win_data *data;
-    BOOL flush = FALSE;
+    BOOL flush = FALSE, managed = TRUE;
+
+    if ((data = get_win_data( hwnd )))
+    {
+        managed = data->managed || data->embedder;
+        release_win_data( data );
+    }
+
+    /* No-activate unmanaged popups (WPF popups, tooltips, overlays...) may still become the
+     * Win32 active window, but taking the X input focus away from the managed window behind
+     * the WM's back is harmful: the focus reverts to the root window as soon as the popup is
+     * unmapped, and keyboard input ends up in whatever window the WM / pointer decides.
+     * Keyboard events are routed to the Win32 focus window regardless of the X focus. */
+    if (!managed && (ex_style & WS_EX_NOACTIVATE))
+    {
+        TRACE( "not taking X focus for no-activate unmanaged window %p\n", hwnd );
+        return;
+    }
 
     if (!is_virtual_desktop())
     {

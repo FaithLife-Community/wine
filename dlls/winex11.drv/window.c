@@ -444,9 +444,15 @@ static BOOL is_window_managed( HWND hwnd, UINT swp_flags, BOOL fullscreen )
     /* child windows are not managed */
     style = NtUserGetWindowLongW( hwnd, GWL_STYLE );
     if ((style & (WS_CHILD|WS_POPUP)) == WS_CHILD) return FALSE;
-    /* activated windows are managed */
-    if (!(swp_flags & (SWP_NOACTIVATE|SWP_HIDEWINDOW))) return TRUE;
-    if (hwnd == get_active_window()) return TRUE;
+    ex_style = NtUserGetWindowLongW( hwnd, GWL_EXSTYLE );
+    /* activated windows are managed, unless they are no-activate popups: those can still be
+     * made active with SetActiveWindow, but the window manager must not be asked to activate
+     * them as we will refuse their WM_TAKE_FOCUS / FocusIn anyway (see can_activate_window). */
+    if (!(ex_style & WS_EX_NOACTIVATE) || !(style & WS_POPUP))
+    {
+        if (!(swp_flags & (SWP_NOACTIVATE|SWP_HIDEWINDOW))) return TRUE;
+        if (hwnd == get_active_window()) return TRUE;
+    }
     /* windows with caption are managed */
     if ((style & WS_CAPTION) == WS_CAPTION) return TRUE;
     /* windows with thick frame are managed */
@@ -459,7 +465,6 @@ static BOOL is_window_managed( HWND hwnd, UINT swp_flags, BOOL fullscreen )
         if (fullscreen) return TRUE;
     }
     /* application windows are managed */
-    ex_style = NtUserGetWindowLongW( hwnd, GWL_EXSTYLE );
     if (ex_style & WS_EX_APPWINDOW) return TRUE;
     /* windows that own popups are managed */
     if (has_owned_popups( hwnd )) return TRUE;
