@@ -431,6 +431,20 @@ static struct x11drv_win_data *alloc_win_data( Display *display, HWND hwnd )
 
 
 /***********************************************************************
+ *		is_window_overlay
+ *
+ * Click-through layered windows without a caption (animations, highlights and
+ * other overlays drawn over the application) cannot be interacted with, so
+ * there is nothing for the window manager to do with them.
+ */
+static BOOL is_window_overlay( DWORD style, DWORD ex_style )
+{
+    if ((ex_style & (WS_EX_LAYERED | WS_EX_TRANSPARENT)) != (WS_EX_LAYERED | WS_EX_TRANSPARENT)) return FALSE;
+    return (style & WS_CAPTION) != WS_CAPTION;
+}
+
+
+/***********************************************************************
  *		is_window_managed
  *
  * Check if a given window should be managed
@@ -445,6 +459,8 @@ static BOOL is_window_managed( HWND hwnd, UINT swp_flags, BOOL fullscreen )
     style = NtUserGetWindowLongW( hwnd, GWL_STYLE );
     if ((style & (WS_CHILD|WS_POPUP)) == WS_CHILD) return FALSE;
     ex_style = NtUserGetWindowLongW( hwnd, GWL_EXSTYLE );
+    /* overlay windows are not managed */
+    if (is_window_overlay( style, ex_style )) return FALSE;
     /* activated windows are managed, unless they are no-activate popups: those can still be
      * made active with SetActiveWindow, but the window manager must not be asked to activate
      * them as we will refuse their WM_TAKE_FOCUS / FocusIn anyway (see can_activate_window). */
@@ -1662,9 +1678,9 @@ static void window_set_managed( struct x11drv_win_data *data, BOOL new_managed )
 
     if (!data->whole_window) return; /* no window, nothing to update */
     if (old_managed == new_managed) return; /* states are the same, nothing to update */
-    if (!new_managed)
+    if (!new_managed && (data->embedded || data->wm_state_serial || data->pending_state.wm_state != WithdrawnState))
     {
-        ERR( "Changing window to unmanaged is not supported\n" );
+        WARN( "window %p/%lx is not withdrawn, cannot change it to unmanaged\n", data->hwnd, data->whole_window );
         return;
     }
 
@@ -3279,6 +3295,9 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
 
     if (!(data = get_win_data( hwnd ))) return;
     if (is_managed) window_set_managed( data, TRUE );
+    /* windows that became overlays while hidden, such as WPF windows which only get their final
+     * styles after creation, are changed back to unmanaged before they get mapped */
+    else if (data->managed && is_window_overlay( new_style, ex_style )) window_set_managed( data, FALSE );
 
     old_rects = data->rects;
     was_fullscreen = data->is_fullscreen;
