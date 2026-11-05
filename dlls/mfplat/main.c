@@ -6289,10 +6289,32 @@ static HRESULT resolver_get_bytestream_url_hint(IMFByteStream *stream, WCHAR con
     return S_OK;
 }
 
+static BOOL use_gst_byte_stream_handler(void)
+{
+    DWORD result, size = sizeof(result);
+
+    /* @@ Wine registry key: HKCU\Software\Wine\MediaFoundation */
+    if (!RegGetValueW(HKEY_CURRENT_USER, L"Software\\Wine\\MediaFoundation", L"DisableGstByteStreamHandler",
+            RRF_RT_REG_DWORD, NULL, &result, &size))
+        return !result;
+
+    return TRUE;
+}
+
+/* Wine-specific fallback for content nothing else claimed. The FFmpeg-based
+ * media source probes the content itself, whatever its container, so when
+ * the GStreamer byte stream handler is disabled use it instead. */
 static HRESULT resolver_create_gstreamer_handler(IMFByteStreamHandler **handler)
 {
     static const GUID CLSID_GStreamerByteStreamHandler = {0x317df618, 0x5e5a, 0x468a, {0x9f, 0x15, 0xd8, 0x27, 0xa9, 0xa0, 0x81, 0x62}};
-    return CoCreateInstance(&CLSID_GStreamerByteStreamHandler, NULL, CLSCTX_INPROC_SERVER, &IID_IMFByteStreamHandler, (void **)handler);
+    static const GUID CLSID_MPEG4ByteStreamHandlerPlugin = {0x271c3902, 0x6095, 0x4c45, {0xa2, 0x2f, 0x20, 0x09, 0x18, 0x16, 0xee, 0x9e}};
+    const GUID *clsid = &CLSID_GStreamerByteStreamHandler;
+
+    if (!use_gst_byte_stream_handler())
+        clsid = &CLSID_MPEG4ByteStreamHandlerPlugin;
+
+    TRACE("Using fallback handler %s.\n", debugstr_guid(clsid));
+    return CoCreateInstance(clsid, NULL, CLSCTX_INPROC_SERVER, &IID_IMFByteStreamHandler, (void **)handler);
 }
 
 static HRESULT resolver_get_bytestream_handler(IMFByteStream *stream, const WCHAR *url, DWORD flags,
@@ -6320,6 +6342,8 @@ static HRESULT resolver_get_bytestream_handler(IMFByteStream *stream, const WCHA
 
     /* Extension */
     url_ext = url ? wcsrchr(url, '.') : NULL;
+
+    TRACE("stream %p, mime type %s, url %s, flags %#lx.\n", stream, debugstr_w(mimeW), debugstr_w(url), flags);
 
     /* If content type was provided by the caller, it's tried first. Otherwise an attempt to deduce
        content type from the content itself is made.
