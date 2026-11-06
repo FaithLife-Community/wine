@@ -26,6 +26,7 @@
 #include "winbase.h"
 #include "winreg.h"
 #include "shlwapi.h"
+#include "wininet.h"
 #include <assert.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(quartz);
@@ -48,6 +49,26 @@ struct request
     IMediaSample *sample;
     DWORD_PTR cookie;
     OVERLAPPED ovl;
+    /* remote sources only */
+    unsigned int serial;
+    BOOL done;
+    DWORD size;
+};
+
+/* http(s) source: the file is streamed into memory as it plays, nothing is written to disk.
+ * FIXME: native uses a separate URL reader filter (CLSID_URLReader) for this. */
+struct remote_source
+{
+    HINTERNET session, request;
+    HANDLE thread;
+    BYTE *data;
+    ULONGLONG size, available;
+    BOOL done, shutdown;
+    HRESULT status;
+    LONG workers;
+    CRITICAL_SECTION cs;
+    CONDITION_VARIABLE cv;
+    WCHAR *url;
 };
 
 struct async_reader
@@ -67,6 +88,7 @@ struct async_reader
     struct request *requests;
     unsigned int max_requests;
     CONDITION_VARIABLE sample_cv;
+    struct remote_source *remote;
 };
 
 static const struct strmbase_source_ops source_ops;
@@ -304,6 +326,296 @@ BOOL get_media_type(const WCHAR *filename, GUID *majortype, GUID *subtype, GUID 
     return FALSE;
 }
 
+/* Reads further ahead than this are fetched with a separate range request
+ * instead of waiting for the download to get there (e.g. ID3v1 tags, seeking). */
+#define REMOTE_RANGE_THRESHOLD (512 * 1024)
+#define REMOTE_CHUNK_SIZE (64 * 1024)
+
+static BOOL is_remote_url(const WCHAR *url)
+{
+    return url && (!wcsnicmp(url, L"http://", 7) || !wcsnicmp(url, L"https://", 8));
+}
+
+static HINTERNET remote_open_url(struct remote_source *remote, const WCHAR *headers, DWORD expect_status)
+{
+    DWORD status = 0, size = sizeof(status);
+    HINTERNET request;
+
+    if (!(request = InternetOpenUrlW(remote->session, remote->url, headers, headers ? -1 : 0,
+            INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_UI | INTERNET_FLAG_NO_COOKIES, 0)))
+    {
+        WARN("Failed to open %s, error %lu.\n", debugstr_w(remote->url), GetLastError());
+        return NULL;
+    }
+    if (!HttpQueryInfoW(request, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER, &status, &size, NULL)
+            || status != expect_status)
+    {
+        WARN("Got HTTP status %lu for %s, expected %lu.\n", status, debugstr_w(remote->url), expect_status);
+        InternetCloseHandle(request);
+        return NULL;
+    }
+    return request;
+}
+
+static DWORD CALLBACK remote_download_thread(void *arg)
+{
+    struct remote_source *remote = arg;
+    HRESULT status = S_OK;
+    DWORD read;
+
+    SetThreadDescription(GetCurrentThread(), L"wine_qz_remote_source");
+
+    for (;;)
+    {
+        ULONGLONG left = remote->size - remote->available;
+
+        if (remote->shutdown || !left)
+            break;
+        if (!InternetReadFile(remote->request, remote->data + remote->available,
+                min(left, REMOTE_CHUNK_SIZE), &read))
+        {
+            status = HRESULT_FROM_WIN32(GetLastError());
+            break;
+        }
+        if (!read)
+        {
+            status = E_FAIL;
+            break;
+        }
+        EnterCriticalSection(&remote->cs);
+        remote->available += read;
+        WakeAllConditionVariable(&remote->cv);
+        LeaveCriticalSection(&remote->cs);
+    }
+
+    if (FAILED(status))
+        WARN("Download of %s stopped at %I64u of %I64u bytes, hr %#lx.\n",
+                debugstr_w(remote->url), remote->available, remote->size, status);
+    else
+        TRACE("Downloaded %I64u bytes.\n", remote->available);
+
+    EnterCriticalSection(&remote->cs);
+    remote->done = TRUE;
+    remote->status = status;
+    WakeAllConditionVariable(&remote->cv);
+    LeaveCriticalSection(&remote->cs);
+    return 0;
+}
+
+static HRESULT remote_read_range(struct remote_source *remote, ULONGLONG offset, DWORD length, BYTE *buffer)
+{
+    WCHAR headers[64];
+    HINTERNET request;
+    DWORD read, total = 0;
+    HRESULT hr = S_OK;
+
+    TRACE("Fetching range %#I64x-%#I64x.\n", offset, offset + length - 1);
+
+    swprintf(headers, ARRAY_SIZE(headers), L"Range: bytes=%I64u-%I64u\r\n", offset, offset + length - 1);
+    if (!(request = remote_open_url(remote, headers, 206)))
+        return E_FAIL;
+    while (total < length)
+    {
+        if (!InternetReadFile(request, buffer + total, length - total, &read))
+        {
+            hr = HRESULT_FROM_WIN32(GetLastError());
+            break;
+        }
+        if (!read)
+        {
+            hr = E_FAIL;
+            break;
+        }
+        total += read;
+    }
+    InternetCloseHandle(request);
+    return hr;
+}
+
+/* Blocks until the requested bytes have arrived. */
+static HRESULT remote_read(struct remote_source *remote, ULONGLONG offset, LONG length, BYTE *buffer, DWORD *ret_size)
+{
+    HRESULT hr;
+
+    *ret_size = 0;
+    if (length <= 0)
+        return S_OK;
+    if (offset >= remote->size)
+        return S_FALSE;
+    if (offset + length > remote->size)
+        length = remote->size - offset;
+
+    EnterCriticalSection(&remote->cs);
+    for (;;)
+    {
+        if (remote->shutdown)
+        {
+            hr = VFW_E_WRONG_STATE;
+            break;
+        }
+        if (offset + length <= remote->available)
+        {
+            memcpy(buffer, remote->data + offset, length);
+            *ret_size = length;
+            hr = S_OK;
+            break;
+        }
+        if (remote->done || offset > remote->available + REMOTE_RANGE_THRESHOLD)
+        {
+            LeaveCriticalSection(&remote->cs);
+            if (SUCCEEDED(hr = remote_read_range(remote, offset, length, buffer)))
+                *ret_size = length;
+            return hr;
+        }
+        SleepConditionVariableCS(&remote->cv, &remote->cs, INFINITE);
+    }
+    LeaveCriticalSection(&remote->cs);
+    return hr;
+}
+
+static HRESULT remote_source_create(const WCHAR *url, struct remote_source **out)
+{
+    WCHAR length_str[32];
+    DWORD size = sizeof(length_str);
+    struct remote_source *remote;
+
+    if (!(remote = calloc(1, sizeof(*remote))))
+        return E_OUTOFMEMORY;
+    InitializeCriticalSection(&remote->cs);
+    InitializeConditionVariable(&remote->cv);
+
+    if (!(remote->url = wcsdup(url))
+            || !(remote->session = InternetOpenW(L"Windows-Media-Player/12.0", INTERNET_OPEN_TYPE_PRECONFIG,
+                NULL, NULL, 0))
+            || !(remote->request = remote_open_url(remote, NULL, 200)))
+        goto fail;
+
+    if (!HttpQueryInfoW(remote->request, HTTP_QUERY_CONTENT_LENGTH, length_str, &size, NULL)
+            || !(remote->size = _wcstoui64(length_str, NULL, 10)))
+    {
+        FIXME("No content length for %s, streams of unknown size are not supported.\n", debugstr_w(url));
+        goto fail;
+    }
+    /* FIXME: the whole file is held in memory while it plays. */
+    if (remote->size > (ULONGLONG)1024 * 1024 * 1024 || !(remote->data = malloc(remote->size)))
+    {
+        WARN("Cannot buffer %I64u bytes.\n", remote->size);
+        goto fail;
+    }
+    TRACE("Streaming %s, %I64u bytes.\n", debugstr_w(url), remote->size);
+
+    if (!(remote->thread = CreateThread(NULL, 0, remote_download_thread, remote, 0, NULL)))
+        goto fail;
+
+    *out = remote;
+    return S_OK;
+
+fail:
+    if (remote->request) InternetCloseHandle(remote->request);
+    if (remote->session) InternetCloseHandle(remote->session);
+    DeleteCriticalSection(&remote->cs);
+    free(remote->data);
+    free(remote->url);
+    free(remote);
+    return HRESULT_FROM_WIN32(ERROR_INTERNET_CANNOT_CONNECT);
+}
+
+static void remote_source_destroy(struct remote_source *remote)
+{
+    EnterCriticalSection(&remote->cs);
+    remote->shutdown = TRUE;
+    WakeAllConditionVariable(&remote->cv);
+    while (remote->workers)
+        SleepConditionVariableCS(&remote->cv, &remote->cs, INFINITE);
+    LeaveCriticalSection(&remote->cs);
+
+    WaitForSingleObject(remote->thread, INFINITE);
+    CloseHandle(remote->thread);
+    InternetCloseHandle(remote->request);
+    InternetCloseHandle(remote->session);
+    DeleteCriticalSection(&remote->cs);
+    free(remote->data);
+    free(remote->url);
+    free(remote);
+}
+
+struct remote_work
+{
+    struct async_reader *filter;
+    struct request *req;
+    IMediaSample *sample;
+    unsigned int serial;
+    ULONGLONG offset;
+    LONG length;
+};
+
+static DWORD CALLBACK remote_request_proc(void *arg)
+{
+    struct remote_work *work = arg;
+    struct async_reader *filter = work->filter;
+    struct remote_source *remote = filter->remote;
+    struct request *req = work->req;
+    DWORD size = 0;
+    BYTE *tmp, *data;
+
+    if ((tmp = malloc(work->length)))
+    {
+        if (FAILED(remote_read(remote, work->offset, work->length, tmp, &size)))
+            size = 0;
+
+        EnterCriticalSection(&filter->sample_cs);
+        /* the request may have been flushed, and its slot reused, while we waited */
+        if (req->sample == work->sample && req->serial == work->serial)
+        {
+            if (size && SUCCEEDED(IMediaSample_GetPointer(work->sample, &data)))
+                memcpy(data, tmp, size);
+            req->size = size;
+            req->done = TRUE;
+            WakeAllConditionVariable(&filter->sample_cv);
+        }
+        LeaveCriticalSection(&filter->sample_cs);
+        free(tmp);
+    }
+
+    free(work);
+    EnterCriticalSection(&remote->cs);
+    --remote->workers;
+    WakeAllConditionVariable(&remote->cv);
+    LeaveCriticalSection(&remote->cs);
+    return 0;
+}
+
+static HRESULT remote_queue_request(struct async_reader *filter, struct request *req, IMediaSample *sample,
+        ULONGLONG offset, LONG length)
+{
+    struct remote_source *remote = filter->remote;
+    struct remote_work *work;
+
+    if (!(work = malloc(sizeof(*work))))
+        return E_OUTOFMEMORY;
+    work->filter = filter;
+    work->req = req;
+    work->sample = sample;
+    work->serial = ++req->serial;
+    work->offset = offset;
+    work->length = length;
+    req->done = FALSE;
+    req->size = 0;
+
+    EnterCriticalSection(&remote->cs);
+    ++remote->workers;
+    LeaveCriticalSection(&remote->cs);
+    if (!QueueUserWorkItem(remote_request_proc, work, WT_EXECUTELONGFUNCTION))
+    {
+        EnterCriticalSection(&remote->cs);
+        --remote->workers;
+        LeaveCriticalSection(&remote->cs);
+        free(work);
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+    return S_OK;
+}
+
 static struct strmbase_pin *async_reader_get_pin(struct strmbase_filter *iface, unsigned int index)
 {
     struct async_reader *filter = impl_from_strmbase_filter(iface);
@@ -332,7 +644,10 @@ static void async_reader_destroy(struct strmbase_filter *iface)
                 CloseHandle(filter->requests[i].ovl.hEvent);
             free(filter->requests);
         }
-        CloseHandle(filter->file);
+        if (filter->remote)
+            remote_source_destroy(filter->remote);
+        else
+            CloseHandle(filter->file);
         strmbase_source_cleanup(&filter->source);
 
         free(filter->pszFileName);
@@ -461,6 +776,37 @@ static HRESULT WINAPI FileSource_Load(IFileSourceFilter * iface, LPCOLESTR pszFi
 
     if (!pszFileName)
         return E_POINTER;
+
+    if (is_remote_url(pszFileName))
+    {
+        struct remote_source *remote;
+        HRESULT hr;
+
+        if (FAILED(hr = remote_source_create(pszFileName, &remote)))
+            return hr;
+        if (This->pszFileName)
+        {
+            free(This->pszFileName);
+            FreeMediaType(&This->mt);
+        }
+        if (!(This->pszFileName = wcsdup(pszFileName)))
+        {
+            remote_source_destroy(remote);
+            return E_OUTOFMEMORY;
+        }
+        This->remote = remote;
+        This->file_size.QuadPart = remote->size;
+        This->file = NULL;
+        This->flushing = FALSE;
+        This->requests = NULL;
+        strmbase_source_init(&This->source, &This->filter, L"Output", &source_ops);
+        BaseFilterImpl_IncrementPinVersion(&This->filter);
+        if (pmt)
+            CopyMediaType(&This->mt, pmt);
+        else
+            CopyMediaType(&This->mt, &default_mt);
+        return S_OK;
+    }
 
     /* open file */
     /* FIXME: check the sharing values that native uses */
@@ -744,7 +1090,16 @@ static HRESULT WINAPI FileAsyncReader_Request(IAsyncReader *iface, IMediaSample 
     req->ovl.OffsetHigh = BYTES_FROM_MEDIATIME(start) >> 32;
     /* No reference is taken. */
 
-    if (ReadFile(filter->file, data, BYTES_FROM_MEDIATIME(end - start), NULL, &req->ovl)
+    if (filter->remote)
+    {
+        if (SUCCEEDED(hr = remote_queue_request(filter, req, sample,
+                BYTES_FROM_MEDIATIME(start), BYTES_FROM_MEDIATIME(end - start))))
+        {
+            req->sample = sample;
+            req->cookie = cookie;
+        }
+    }
+    else if (ReadFile(filter->file, data, BYTES_FROM_MEDIATIME(end - start), NULL, &req->ovl)
             || GetLastError() == ERROR_IO_PENDING)
     {
         hr = S_OK;
@@ -784,7 +1139,8 @@ static HRESULT WINAPI FileAsyncReader_WaitForNext(IAsyncReader *iface,
             struct request *req = &filter->requests[i];
             DWORD size;
 
-            if (req->sample && GetOverlappedResult(filter->file, &req->ovl, &size, FALSE))
+            if (req->sample && (filter->remote ? (req->done && ((size = req->size), TRUE))
+                    : GetOverlappedResult(filter->file, &req->ovl, &size, FALSE)))
             {
                 REFERENCE_TIME start, end;
 
@@ -849,6 +1205,17 @@ static HRESULT WINAPI FileAsyncReader_SyncReadAligned(IAsyncReader *iface, IMedi
     if (SUCCEEDED(hr))
     {
         length = BYTES_FROM_MEDIATIME(end_time - start_time);
+        if (filter->remote)
+        {
+            hr = remote_read(filter->remote, BYTES_FROM_MEDIATIME(start_time), length, buffer, &read_len);
+            if (hr == S_OK && read_len != length)
+                hr = S_FALSE;
+            else if (hr == S_FALSE)
+                hr = S_OK;
+            if (SUCCEEDED(hr))
+                IMediaSample_SetActualDataLength(sample, read_len);
+            return hr;
+        }
         ret = sync_read(filter->file, BYTES_FROM_MEDIATIME(start_time), length, buffer, &read_len);
         if (ret)
             hr = (read_len == length) ? S_OK : S_FALSE;
@@ -874,6 +1241,14 @@ static HRESULT WINAPI FileAsyncReader_SyncRead(IAsyncReader *iface,
 
     TRACE("filter %p, offset %#I64x, length %ld, buffer %p.\n", filter, offset, length, buffer);
 
+    if (filter->remote)
+    {
+        hr = remote_read(filter->remote, offset, length, buffer, &read_len);
+        if (hr == S_OK && read_len != length)
+            hr = S_FALSE;
+        return hr;
+    }
+
     ret = sync_read(filter->file, offset, length, buffer, &read_len);
     if (ret)
         hr = (read_len == length) ? S_OK : S_FALSE;
@@ -892,6 +1267,14 @@ static HRESULT WINAPI FileAsyncReader_Length(IAsyncReader *iface, LONGLONG *tota
     TRACE("iface %p, total %p, available %p.\n", iface, total, available);
 
     *available = *total = filter->file_size.QuadPart;
+    if (filter->remote)
+    {
+        EnterCriticalSection(&filter->remote->cs);
+        *available = filter->remote->available;
+        LeaveCriticalSection(&filter->remote->cs);
+        if (*available < *total)
+            return VFW_S_ESTIMATED;
+    }
 
     return S_OK;
 }
@@ -908,7 +1291,8 @@ static HRESULT WINAPI FileAsyncReader_BeginFlush(IAsyncReader * iface)
     filter->flushing = TRUE;
     for (i = 0; i < filter->max_requests; ++i)
         filter->requests[i].sample = NULL;
-    CancelIoEx(filter->file, NULL);
+    if (!filter->remote)
+        CancelIoEx(filter->file, NULL);
     WakeAllConditionVariable(&filter->sample_cv);
 
     LeaveCriticalSection(&filter->sample_cs);
