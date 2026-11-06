@@ -57,6 +57,7 @@ struct mp3_decoder
 
     IMediaBuffer *buffer;
     REFERENCE_TIME timestamp;
+    BOOL timestamp_set; /* timestamp was taken from the input */
 
     BOOL draining;
 };
@@ -434,6 +435,7 @@ static HRESULT WINAPI MediaObject_Flush(IMediaObject *iface)
         IMediaBuffer_Release(dmo->buffer);
     dmo->buffer = NULL;
     dmo->timestamp = 0;
+    dmo->timestamp_set = FALSE;
 
     /* mpg123 doesn't give us a way to flush, so just close and reopen the feed. */
     mpg123_close(dmo->mh);
@@ -444,8 +446,15 @@ static HRESULT WINAPI MediaObject_Flush(IMediaObject *iface)
 
 static HRESULT WINAPI MediaObject_Discontinuity(IMediaObject *iface, DWORD index)
 {
-    TRACE("iface %p.\n", iface);
+    struct mp3_decoder *dmo = impl_from_IMediaObject(iface);
 
+    TRACE("iface %p, index %lu.\n", iface, index);
+
+    if (index)
+        return DMO_E_INVALIDSTREAMINDEX;
+
+    /* Take the next timestamp from the input again. */
+    dmo->timestamp_set = FALSE;
     return S_OK;
 }
 
@@ -489,6 +498,14 @@ static HRESULT WINAPI MediaObject_ProcessInput(IMediaObject *iface, DWORD index,
     {
         ERR("Already have a buffer.\n");
         return DMO_E_NOTACCEPTING;
+    }
+
+    /* Output timestamps used to always start from 0, so after a seek the session dropped
+     * everything as being before the start position. Start from the input's timestamp. */
+    if ((flags & DMO_INPUT_DATA_BUFFERF_TIME) && !This->timestamp_set)
+    {
+        This->timestamp = timestamp;
+        This->timestamp_set = TRUE;
     }
 
     IMediaBuffer_AddRef(buffer);
