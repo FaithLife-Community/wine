@@ -96,6 +96,8 @@ struct media_player
     IMFPMediaItem *item;
     MFP_CREATION_OPTIONS options;
     MFP_MEDIAPLAYER_STATE state;
+    BOOL position_set_pending;  /* the next MESessionStarted comes from SetPosition() */
+    PROPVARIANT start_position; /* position set while stopped, used by the next Play() */
     HWND event_window;
     HWND output_window;
     CRITICAL_SECTION cs;
@@ -1004,7 +1006,10 @@ static HRESULT WINAPI media_player_Play(IMFPMediaPlayer *iface)
 
     TRACE("%p.\n", iface);
 
-    pos.vt = VT_EMPTY;
+    EnterCriticalSection(&player->cs);
+    pos = player->start_position;
+    player->start_position.vt = VT_EMPTY;
+    LeaveCriticalSection(&player->cs);
     return IMFMediaSession_Start(player->session, &GUID_NULL, &pos);
 }
 
@@ -1035,9 +1040,40 @@ static HRESULT WINAPI media_player_FrameStep(IMFPMediaPlayer *iface)
 
 static HRESULT WINAPI media_player_SetPosition(IMFPMediaPlayer *iface, REFGUID postype, const PROPVARIANT *position)
 {
-    FIXME("%p, %s, %p.\n", iface, debugstr_guid(postype), position);
+    struct media_player *player = impl_from_IMFPMediaPlayer(iface);
+    PROPVARIANT pos;
+    HRESULT hr = S_OK;
 
-    return E_NOTIMPL;
+    TRACE("%p, %s, %p.\n", iface, debugstr_guid(postype), position);
+
+    if (!position)
+        return E_POINTER;
+    if (!IsEqualGUID(postype, &MFP_POSITIONTYPE_100NS))
+        return E_INVALIDARG;
+    if (position->vt != VT_I8 && position->vt != VT_UI8)
+        return E_INVALIDARG;
+
+    pos.vt = VT_I8;
+    pos.hVal.QuadPart = position->hVal.QuadPart;
+
+    EnterCriticalSection(&player->cs);
+    if (player->state == MFP_MEDIAPLAYER_STATE_SHUTDOWN)
+        hr = MF_E_SHUTDOWN;
+    else if (!player->item)
+        hr = MF_E_INVALIDREQUEST;
+    else if (player->state == MFP_MEDIAPLAYER_STATE_PLAYING || player->state == MFP_MEDIAPLAYER_STATE_PAUSED)
+    {
+        /* The session seeks by starting at the new position; stay paused if paused. */
+        player->position_set_pending = TRUE;
+        if (SUCCEEDED(hr = IMFMediaSession_Start(player->session, &GUID_NULL, &pos))
+                && player->state == MFP_MEDIAPLAYER_STATE_PAUSED)
+            hr = IMFMediaSession_Pause(player->session);
+    }
+    else
+        player->start_position = pos;
+    LeaveCriticalSection(&player->cs);
+
+    return hr;
 }
 
 static HRESULT WINAPI media_player_GetPosition(IMFPMediaPlayer *iface, REFGUID postype, PROPVARIANT *position)
@@ -1513,18 +1549,50 @@ static HRESULT WINAPI media_player_GetMediaItem(IMFPMediaPlayer *iface, IMFPMedi
     return hr;
 }
 
+static HRESULT media_player_get_simple_volume(struct media_player *player, IMFSimpleAudioVolume **volume)
+{
+    return MFGetService((IUnknown *)player->session, &MR_POLICY_VOLUME_SERVICE, &IID_IMFSimpleAudioVolume,
+            (void **)volume);
+}
+
 static HRESULT WINAPI media_player_GetVolume(IMFPMediaPlayer *iface, float *volume)
 {
-    FIXME("%p, %p.\n", iface, volume);
+    struct media_player *player = impl_from_IMFPMediaPlayer(iface);
+    IMFSimpleAudioVolume *simple_volume;
+    HRESULT hr;
 
-    return E_NOTIMPL;
+    TRACE("%p, %p.\n", iface, volume);
+
+    if (!volume)
+        return E_POINTER;
+
+    if (SUCCEEDED(hr = media_player_get_simple_volume(player, &simple_volume)))
+    {
+        hr = IMFSimpleAudioVolume_GetMasterVolume(simple_volume, volume);
+        IMFSimpleAudioVolume_Release(simple_volume);
+    }
+
+    return hr;
 }
 
 static HRESULT WINAPI media_player_SetVolume(IMFPMediaPlayer *iface, float volume)
 {
-    FIXME("%p, %.8e.\n", iface, volume);
+    struct media_player *player = impl_from_IMFPMediaPlayer(iface);
+    IMFSimpleAudioVolume *simple_volume;
+    HRESULT hr;
 
-    return E_NOTIMPL;
+    TRACE("%p, %.8e.\n", iface, volume);
+
+    if (volume < 0.0f || volume > 1.0f)
+        return E_INVALIDARG;
+
+    if (SUCCEEDED(hr = media_player_get_simple_volume(player, &simple_volume)))
+    {
+        hr = IMFSimpleAudioVolume_SetMasterVolume(simple_volume, volume);
+        IMFSimpleAudioVolume_Release(simple_volume);
+    }
+
+    return hr;
 }
 
 static HRESULT WINAPI media_player_GetBalance(IMFPMediaPlayer *iface, float *balance)
@@ -1543,16 +1611,39 @@ static HRESULT WINAPI media_player_SetBalance(IMFPMediaPlayer *iface, float bala
 
 static HRESULT WINAPI media_player_GetMute(IMFPMediaPlayer *iface, BOOL *mute)
 {
-    FIXME("%p, %p.\n", iface, mute);
+    struct media_player *player = impl_from_IMFPMediaPlayer(iface);
+    IMFSimpleAudioVolume *simple_volume;
+    HRESULT hr;
 
-    return E_NOTIMPL;
+    TRACE("%p, %p.\n", iface, mute);
+
+    if (!mute)
+        return E_POINTER;
+
+    if (SUCCEEDED(hr = media_player_get_simple_volume(player, &simple_volume)))
+    {
+        hr = IMFSimpleAudioVolume_GetMute(simple_volume, mute);
+        IMFSimpleAudioVolume_Release(simple_volume);
+    }
+
+    return hr;
 }
 
 static HRESULT WINAPI media_player_SetMute(IMFPMediaPlayer *iface, BOOL mute)
 {
-    FIXME("%p, %d.\n", iface, mute);
+    struct media_player *player = impl_from_IMFPMediaPlayer(iface);
+    IMFSimpleAudioVolume *simple_volume;
+    HRESULT hr;
 
-    return E_NOTIMPL;
+    TRACE("%p, %d.\n", iface, mute);
+
+    if (SUCCEEDED(hr = media_player_get_simple_volume(player, &simple_volume)))
+    {
+        hr = IMFSimpleAudioVolume_SetMute(simple_volume, mute);
+        IMFSimpleAudioVolume_Release(simple_volume);
+    }
+
+    return hr;
 }
 
 static HRESULT media_player_get_display_control(const struct media_player *player,
@@ -2161,6 +2252,16 @@ static HRESULT WINAPI media_player_session_events_callback_Invoke(IMFAsyncCallba
         case MESessionStarted:
         case MESessionStopped:
         case MESessionPaused:
+
+            if (session_event_type == MESessionStarted && player->position_set_pending)
+            {
+                EnterCriticalSection(&player->cs);
+                player->position_set_pending = FALSE;
+                media_player_set_state(player, MFP_MEDIAPLAYER_STATE_PLAYING);
+                media_event_create(player, MFP_EVENT_TYPE_POSITION_SET, event_status, player->item, &event);
+                LeaveCriticalSection(&player->cs);
+                break;
+            }
 
             if (session_event_type == MESessionStarted)
                 state = MFP_MEDIAPLAYER_STATE_PLAYING;
