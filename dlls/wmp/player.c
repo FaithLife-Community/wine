@@ -967,15 +967,15 @@ static HRESULT WINAPI WMPSettings_get_rate(IWMPSettings *iface, double *p)
 static HRESULT WINAPI WMPSettings_put_rate(IWMPSettings *iface, double v)
 {
     WindowsMediaPlayer *This = impl_from_IWMPSettings(iface);
-    HRESULT hr;
 
     TRACE("(%p)->(%lf)\n", This, v);
     if (v <= 0.0)
         return E_INVALIDARG;
     This->rate = v;
-    /* FIXME: the audio renderer ignores rates other than 1, so playback stays at normal speed. */
-    if (This->media_seeking && FAILED(hr = IMediaSeeking_SetRate(This->media_seeking, v)))
-        FIXME("Failed to set rate %f, hr %#lx.\n", v, hr);
+    /* FIXME: quartz's audio renderer can't play faster or slower without changing the pitch;
+     * passing the rate on left it silent. Store it and keep playing at normal speed. */
+    if (v != 1.0)
+        FIXME("Ignoring rate %f.\n", v);
     return S_OK;
 }
 
@@ -1693,8 +1693,6 @@ static HRESULT WINAPI WMPControls_play(IWMPControls *iface)
             hres = IGraphBuilder_QueryInterface(This->filter_graph, &IID_IBasicAudio, (void**)&This->basic_audio);
         if (SUCCEEDED(hres))
             hres = IWMPSettings_put_volume(&This->IWMPSettings_iface, This->volume);
-        if (SUCCEEDED(hres) && This->rate != 1.0)
-            IWMPSettings_put_rate(&This->IWMPSettings_iface, This->rate);
 
         if (FAILED(hres))
         {
