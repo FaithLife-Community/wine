@@ -1738,10 +1738,39 @@ static NTSTATUS CDECL media_source_seek_cb( struct winedmo_stream *stream, UINT6
 static NTSTATUS CDECL media_source_read_cb(struct winedmo_stream *stream, BYTE *buffer, ULONG *size)
 {
     struct media_source *source = CONTAINING_RECORD(stream, struct media_source, winedmo_stream);
+    ULONG read, waited = 0;
+    QWORD pos;
+
     TRACE("stream %p, buffer %p, size %p\n", stream, buffer, size);
 
-    if (FAILED(IMFByteStream_Read(source->stream, buffer, *size, size)))
-        return STATUS_UNSUCCESSFUL;
+    for (;;)
+    {
+        if (FAILED(IMFByteStream_Read(source->stream, buffer, *size, &read)))
+            return STATUS_UNSUCCESSFUL;
+        if (read || !*size)
+            break;
+
+        /* A byte stream that is still downloading (e.g. an application's own stream) may return
+         * nothing for data that hasn't arrived yet. FFmpeg takes a zero-length read as the end
+         * of the file, which ended playback a few seconds after seeking ahead. Wait for the data
+         * unless we really are at the end. */
+        if (source->file_size == -1 || FAILED(IMFByteStream_GetCurrentPosition(source->stream, &pos))
+                || pos >= source->file_size)
+            break;
+        if (waited >= 30000)
+        {
+            WARN("No data at %#I64x of %#I64x after %lu ms, giving up.\n", pos, source->file_size, waited);
+            break;
+        }
+        if (!waited)
+            TRACE("No data yet at %#I64x of %#I64x, waiting.\n", pos, source->file_size);
+        Sleep(20);
+        waited += 20;
+    }
+    if (waited)
+        TRACE("Waited %lu ms for data.\n", waited);
+
+    *size = read;
     return STATUS_SUCCESS;
 }
 
