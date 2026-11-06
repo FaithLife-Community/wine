@@ -1589,10 +1589,27 @@ static WCHAR *resolve_media_url(const WCHAR *url)
             current = next;
             continue;
         }
-        return current;
+        break;
     }
-    free(current);
-    return NULL;
+    if (depth == 4)
+    {
+        free(current);
+        return NULL;
+    }
+
+    /* Local entries may carry WMP parameters, e.g. "file.mp3?SAMI=file.smi" for captions.
+     * FIXME: SAMI captions are ignored. */
+    if (current && wcsnicmp(current, L"http://", 7) && wcsnicmp(current, L"https://", 8))
+    {
+        WCHAR *query = wcschr(current, '?');
+
+        if (query && GetFileAttributesW(current) == INVALID_FILE_ATTRIBUTES)
+        {
+            *query = 0;
+            TRACE("Ignoring parameters %s.\n", debugstr_w(query + 1));
+        }
+    }
+    return current;
 }
 
 static HRESULT WINAPI WMPControls_play(IWMPControls *iface)
