@@ -94,6 +94,8 @@ struct WindowsMediaPlayer {
     VARIANT_BOOL invoke_urls;
     VARIANT_BOOL enable_error_dialogs;
     LONG volume;
+    double rate;
+    LONG play_state, open_state;
 
     ConnectionPoint *wmpocx;
 
