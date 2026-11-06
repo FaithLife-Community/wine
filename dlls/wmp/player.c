@@ -22,7 +22,6 @@
 #include <nserror.h>
 #include "wmpids.h"
 #include "shlwapi.h"
-#include "urlmon.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(wmp);
 
@@ -1461,30 +1460,6 @@ static HRESULT WINAPI WMPControls_get_isAvailable(IWMPControls *iface, BSTR bstr
     return S_OK;
 }
 
-/* Wine's quartz has no URL reader, so http(s) media is fetched into the
- * urlmon cache and played from there.
- * FIXME: this downloads the whole file before playback starts. */
-static WCHAR *download_url(const WCHAR *url)
-{
-    WCHAR path[MAX_PATH];
-    HRESULT hr;
-
-    TRACE("Downloading %s.\n", debugstr_w(url));
-    hr = URLDownloadToCacheFileW(NULL, url, path, ARRAY_SIZE(path), 0, NULL);
-    if (FAILED(hr))
-    {
-        WARN("Failed to download %s, hr %#lx.\n", debugstr_w(url), hr);
-        return NULL;
-    }
-    TRACE("Downloaded to %s.\n", debugstr_w(path));
-    return wcsdup(path);
-}
-
-static BOOL is_remote_url(const WCHAR *url)
-{
-    return !wcsnicmp(url, L"http://", 7) || !wcsnicmp(url, L"https://", 8);
-}
-
 static BOOL is_asx_url(const WCHAR *url)
 {
     const WCHAR *end = url + wcscspn(url, L"?#"), *ext = end;
@@ -1598,7 +1573,8 @@ static WCHAR *get_asx_first_ref(const WCHAR *file)
     return ret;
 }
 
-/* Turns a media URL into something quartz can open: a local file. */
+/* Replaces a local ASX playlist with its first entry, which quartz can open.
+ * FIXME: playlists on http(s) URLs are not supported. */
 static WCHAR *resolve_media_url(const WCHAR *url)
 {
     WCHAR *current = wcsdup(url), *next;
@@ -1606,13 +1582,7 @@ static WCHAR *resolve_media_url(const WCHAR *url)
 
     for (depth = 0; current && depth < 4; ++depth)
     {
-        if (is_remote_url(current))
-        {
-            next = download_url(current);
-            free(current);
-            current = next;
-        }
-        if (current && is_asx_url(current))
+        if (wcsnicmp(current, L"http://", 7) && wcsnicmp(current, L"https://", 8) && is_asx_url(current))
         {
             next = get_asx_first_ref(current);
             free(current);
