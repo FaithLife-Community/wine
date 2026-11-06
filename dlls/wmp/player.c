@@ -43,6 +43,11 @@ static void update_state(WindowsMediaPlayer *wmp, LONG type, LONG state)
     V_VT(params) = VT_UI4;
     V_UI4(params) = state;
 
+    if (type == DISPID_WMPCOREEVENT_PLAYSTATECHANGE)
+        wmp->play_state = state;
+    else if (type == DISPID_WMPCOREEVENT_OPENSTATECHANGE)
+        wmp->open_state = state;
+
     call_sink(wmp->wmpocx, type, &dispparams);
 }
 
@@ -173,15 +178,21 @@ static HRESULT WINAPI WMPPlayer4_put_URL(IWMPPlayer4 *iface, BSTR url)
 static HRESULT WINAPI WMPPlayer4_get_openState(IWMPPlayer4 *iface, WMPOpenState *pwmpos)
 {
     WindowsMediaPlayer *This = impl_from_IWMPPlayer4(iface);
-    FIXME("(%p)->(%p)\n", This, pwmpos);
-    return E_NOTIMPL;
+    TRACE("(%p)->(%p)\n", This, pwmpos);
+    if (!pwmpos)
+        return E_POINTER;
+    *pwmpos = This->open_state;
+    return S_OK;
 }
 
 static HRESULT WINAPI WMPPlayer4_get_playState(IWMPPlayer4 *iface, WMPPlayState *pwmpps)
 {
     WindowsMediaPlayer *This = impl_from_IWMPPlayer4(iface);
-    FIXME("(%p)->(%p)\n", This, pwmpps);
-    return E_NOTIMPL;
+    TRACE("(%p)->(%p)\n", This, pwmpps);
+    if (!pwmpps)
+        return E_POINTER;
+    *pwmpps = This->play_state;
+    return S_OK;
 }
 
 static HRESULT WINAPI WMPPlayer4_get_controls(IWMPPlayer4 *iface, IWMPControls **ppControl)
@@ -946,15 +957,26 @@ static HRESULT WINAPI WMPSettings_put_playCount(IWMPSettings *iface, LONG v)
 static HRESULT WINAPI WMPSettings_get_rate(IWMPSettings *iface, double *p)
 {
     WindowsMediaPlayer *This = impl_from_IWMPSettings(iface);
-    FIXME("(%p)->(%p)\n", This, p);
-    return E_NOTIMPL;
+    TRACE("(%p)->(%p)\n", This, p);
+    if (!p)
+        return E_POINTER;
+    *p = This->rate;
+    return S_OK;
 }
 
 static HRESULT WINAPI WMPSettings_put_rate(IWMPSettings *iface, double v)
 {
     WindowsMediaPlayer *This = impl_from_IWMPSettings(iface);
-    FIXME("(%p)->(%lf)\n", This, v);
-    return E_NOTIMPL;
+    HRESULT hr;
+
+    TRACE("(%p)->(%lf)\n", This, v);
+    if (v <= 0.0)
+        return E_INVALIDARG;
+    This->rate = v;
+    /* FIXME: the audio renderer ignores rates other than 1, so playback stays at normal speed. */
+    if (This->media_seeking && FAILED(hr = IMediaSeeking_SetRate(This->media_seeking, v)))
+        FIXME("Failed to set rate %f, hr %#lx.\n", v, hr);
+    return S_OK;
 }
 
 static HRESULT WINAPI WMPSettings_get_balance(IWMPSettings *iface, LONG *p)
@@ -1454,9 +1476,12 @@ static HRESULT WINAPI WMPControls_get_isAvailable(IWMPControls *iface, BSTR bstr
         IMediaSeeking_GetCapabilities(This->media_seeking, &capabilities);
         *pIsAvailable = (capabilities & AM_SEEKING_CanSeekAbsolute) ?
             VARIANT_TRUE : VARIANT_FALSE;
+    } else if (!wcsicmp(L"play", bstrItem) || !wcsicmp(L"stop", bstrItem) || !wcsicmp(L"pause", bstrItem)) {
+        *pIsAvailable = VARIANT_TRUE;
     } else {
-        FIXME("%s not implemented\n", debugstr_w(bstrItem));
-        return E_NOTIMPL;
+        /* fastForward, fastReverse, next, previous, ... */
+        FIXME("%s not implemented, reporting unavailable\n", debugstr_w(bstrItem));
+        *pIsAvailable = VARIANT_FALSE;
     }
 
     return S_OK;
@@ -1668,6 +1693,8 @@ static HRESULT WINAPI WMPControls_play(IWMPControls *iface)
             hres = IGraphBuilder_QueryInterface(This->filter_graph, &IID_IBasicAudio, (void**)&This->basic_audio);
         if (SUCCEEDED(hres))
             hres = IWMPSettings_put_volume(&This->IWMPSettings_iface, This->volume);
+        if (SUCCEEDED(hres) && This->rate != 1.0)
+            IWMPSettings_put_rate(&This->IWMPSettings_iface, This->rate);
 
         if (FAILED(hres))
         {
@@ -2433,6 +2460,7 @@ BOOL init_player(WindowsMediaPlayer *wmp)
     wmp->invoke_urls = VARIANT_TRUE;
     wmp->auto_start = VARIANT_TRUE;
     wmp->volume = 100;
+    wmp->rate = 1.0;
     return TRUE;
 }
 
