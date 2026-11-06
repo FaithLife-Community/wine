@@ -1667,6 +1667,13 @@ static HRESULT WINAPI audio_renderer_stream_Flush(IMFStreamSink *iface)
         renderer->queued_frames = 0;
         if (renderer->audio_client)
         {
+            BOOL running = renderer->clock_state == MFCLOCK_STATE_RUNNING && renderer->rate != 0.0f;
+
+            /* The session flushes without stopping the clock when seeking during playback.
+             * IAudioClient::Reset() fails on a running client, which left the old audio
+             * playing and the position counting on from before the seek. */
+            if (running && FAILED(hr = IAudioClient_Stop(renderer->audio_client)))
+                WARN("Failed to stop audio client, hr %#lx.\n", hr);
             if (SUCCEEDED(hr = IAudioClient_Reset(renderer->audio_client)))
             {
                 renderer->position = 0;
@@ -1674,6 +1681,8 @@ static HRESULT WINAPI audio_renderer_stream_Flush(IMFStreamSink *iface)
             }
             else
                 WARN("Failed to reset audio client, hr %#lx.\n", hr);
+            if (running && FAILED(IAudioClient_Start(renderer->audio_client)))
+                WARN("Failed to restart audio client.\n");
         }
     }
     LeaveCriticalSection(&renderer->cs);
