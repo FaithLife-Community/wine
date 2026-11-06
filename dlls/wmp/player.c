@@ -22,6 +22,7 @@
 #include <nserror.h>
 #include "wmpids.h"
 #include "shlwapi.h"
+#include <math.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(wmp);
 
@@ -988,8 +989,9 @@ static HRESULT WINAPI WMPSettings_put_volume(IWMPSettings *iface, LONG v)
     if (!This->filter_graph)
         return S_OK;
 
-    /* IBasicAudio -   [-10000, 0], wmp - [0, 100] */
-    v = 10000 * v / 100 - 10000;
+    /* IBasicAudio is in hundredths of a decibel, [-10000, 0]; wmp is a linear [0, 100].
+     * Mapping linearly made half volume -50 dB, which is inaudible. */
+    v = (v <= 0) ? -10000 : (v >= 100) ? 0 : max(-10000, (LONG)(2000.0 * log10(v / 100.0)));
     if (!This->basic_audio)
         return S_FALSE;
 
