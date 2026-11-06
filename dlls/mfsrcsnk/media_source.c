@@ -1738,28 +1738,31 @@ static NTSTATUS CDECL media_source_seek_cb( struct winedmo_stream *stream, UINT6
 static NTSTATUS CDECL media_source_read_cb(struct winedmo_stream *stream, BYTE *buffer, ULONG *size)
 {
     struct media_source *source = CONTAINING_RECORD(stream, struct media_source, winedmo_stream);
-    ULONG read, waited = 0;
+    ULONG total = 0, read, waited = 0, calls = 0;
+    HRESULT hr = S_OK;
     QWORD pos;
 
     TRACE("stream %p, buffer %p, size %p\n", stream, buffer, size);
 
-    for (;;)
+    /* winedmo caches the stream in fixed-size blocks and takes a short block for the end of the
+     * stream. IMFByteStream::Read() may return fewer bytes than asked for anywhere, e.g. for a
+     * stream that is still downloading, so keep reading until the block is full or the stream
+     * really ends. Short reads used to end playback a few seconds after seeking. */
+    while (total < *size)
     {
-        HRESULT hr;
-
-        if (FAILED(hr = IMFByteStream_Read(source->stream, buffer, *size, &read)))
+        ++calls;
+        if (FAILED(hr = IMFByteStream_Read(source->stream, buffer + total, *size - total, &read)))
         {
             if (!waited)
-                WARN("Read of %lu bytes failed, hr %#lx.\n", *size, hr);
+                WARN("Read of %lu bytes failed, hr %#lx.\n", *size - total, hr);
             read = 0;
         }
-        else if (read || !*size)
-            break;
+        if (read)
+        {
+            total += read;
+            continue;
+        }
 
-        /* A byte stream that is still downloading (e.g. an application's own stream) may return
-         * nothing for data that hasn't arrived yet. FFmpeg takes a zero-length read as the end
-         * of the file, which ended playback a few seconds after seeking ahead. Wait for the data
-         * unless we really are at the end. */
         if (source->file_size == -1 || FAILED(IMFByteStream_GetCurrentPosition(source->stream, &pos)))
             break;
         if (pos >= source->file_size)
@@ -1779,8 +1782,6 @@ static NTSTATUS CDECL media_source_read_cb(struct winedmo_stream *stream, BYTE *
         if (waited >= 30000)
         {
             WARN("No data at %#I64x of %#I64x after %lu ms, giving up.\n", pos, source->file_size, waited);
-            if (FAILED(hr))
-                return STATUS_UNSUCCESSFUL;
             break;
         }
         if (!waited)
@@ -1788,10 +1789,13 @@ static NTSTATUS CDECL media_source_read_cb(struct winedmo_stream *stream, BYTE *
         Sleep(20);
         waited += 20;
     }
-    if (waited)
-        TRACE("Waited %lu ms for data.\n", waited);
 
-    *size = read;
+    if (calls > 1)
+        TRACE("Read %#lx of %#lx bytes in %lu calls, waited %lu ms.\n", total, *size, calls, waited);
+    if (!total && FAILED(hr))
+        return STATUS_UNSUCCESSFUL;
+
+    *size = total;
     return STATUS_SUCCESS;
 }
 
