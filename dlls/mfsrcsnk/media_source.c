@@ -1745,21 +1745,42 @@ static NTSTATUS CDECL media_source_read_cb(struct winedmo_stream *stream, BYTE *
 
     for (;;)
     {
-        if (FAILED(IMFByteStream_Read(source->stream, buffer, *size, &read)))
-            return STATUS_UNSUCCESSFUL;
-        if (read || !*size)
+        HRESULT hr;
+
+        if (FAILED(hr = IMFByteStream_Read(source->stream, buffer, *size, &read)))
+        {
+            if (!waited)
+                WARN("Read of %lu bytes failed, hr %#lx.\n", *size, hr);
+            read = 0;
+        }
+        else if (read || !*size)
             break;
 
         /* A byte stream that is still downloading (e.g. an application's own stream) may return
          * nothing for data that hasn't arrived yet. FFmpeg takes a zero-length read as the end
          * of the file, which ended playback a few seconds after seeking ahead. Wait for the data
          * unless we really are at the end. */
-        if (source->file_size == -1 || FAILED(IMFByteStream_GetCurrentPosition(source->stream, &pos))
-                || pos >= source->file_size)
+        if (source->file_size == -1 || FAILED(IMFByteStream_GetCurrentPosition(source->stream, &pos)))
             break;
+        if (pos >= source->file_size)
+        {
+            QWORD length;
+
+            /* The length of a stream that is still downloading may grow. */
+            if (FAILED(IMFByteStream_GetLength(source->stream, &length)) || length <= source->file_size)
+            {
+                TRACE("End of stream at %#I64x.\n", pos);
+                break;
+            }
+            WARN("Stream length grew from %#I64x to %#I64x.\n", source->file_size, length);
+            source->file_size = length;
+            continue;
+        }
         if (waited >= 30000)
         {
             WARN("No data at %#I64x of %#I64x after %lu ms, giving up.\n", pos, source->file_size, waited);
+            if (FAILED(hr))
+                return STATUS_UNSUCCESSFUL;
             break;
         }
         if (!waited)
@@ -1787,6 +1808,12 @@ static HRESULT media_source_async_create(struct media_source *source, IMFAsyncRe
     {
         WARN("Failed to get byte stream length, hr %#lx\n", hr);
         source->file_size = -1;
+    }
+    else
+    {
+        DWORD caps = 0;
+        IMFByteStream_GetCapabilities(source->stream, &caps);
+        TRACE("Byte stream length %#I64x, capabilities %#lx.\n", source->file_size, caps);
     }
     if (FAILED(hr = IMFByteStream_SetCurrentPosition(source->stream, 0)))
     {

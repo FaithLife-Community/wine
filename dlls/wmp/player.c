@@ -1781,8 +1781,15 @@ static HRESULT WINAPI WMPControls_stop(IWMPControls *iface)
 static HRESULT WINAPI WMPControls_pause(IWMPControls *iface)
 {
     WindowsMediaPlayer *This = impl_from_IWMPControls(iface);
-    FIXME("(%p)\n", This);
-    return E_NOTIMPL;
+    HRESULT hres;
+
+    TRACE("(%p)\n", This);
+    if (!This->media_control)
+        return NS_S_WMPCORE_COMMAND_NOT_AVAILABLE;
+    if (FAILED(hres = IMediaControl_Pause(This->media_control)))
+        return hres;
+    update_state(This, DISPID_WMPCOREEVENT_PLAYSTATECHANGE, wmppsPaused);
+    return S_OK;
 }
 
 static HRESULT WINAPI WMPControls_fastForward(IWMPControls *iface)
