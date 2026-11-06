@@ -24,6 +24,10 @@
 #include "shlwapi.h"
 #include <math.h>
 
+/* Media Foundation GUIDs used here; mfuuid's definitions clash with wmp_main.c's initguid.h. */
+static const GUID wmp_MF_BYTESTREAM_CONTENT_TYPE = {0xfc358289,0x3cb6,0x460c,{0xa4,0x24,0xb6,0x68,0x12,0x60,0x37,0x5a}};
+#define MFP_POSITIONTYPE_100NS GUID_NULL
+
 WINE_DEFAULT_DEBUG_CHANNEL(wmp);
 
 static ATOM player_msg_class;
@@ -1008,16 +1012,13 @@ static HRESULT WINAPI WMPSettings_put_volume(IWMPSettings *iface, LONG v)
     WindowsMediaPlayer *This = impl_from_IWMPSettings(iface);
     TRACE("(%p)->(%ld)\n", This, v);
     This->volume = v;
-    if (!This->filter_graph)
+    if (!This->mf_player || !This->item_set)
         return S_OK;
 
-    /* IBasicAudio is in hundredths of a decibel, [-10000, 0]; wmp is a linear [0, 100].
-     * Mapping linearly made half volume -50 dB, which is inaudible. */
-    v = (v <= 0) ? -10000 : (v >= 100) ? 0 : max(-10000, (LONG)(2000.0 * log10(v / 100.0)));
-    if (!This->basic_audio)
+    /* wmp's [0, 100] is linear in amplitude, like the session's master volume. */
+    if (FAILED(IMFPMediaPlayer_SetVolume(This->mf_player, min(max(v, 0), 100) / 100.0f)))
         return S_FALSE;
-
-    return IBasicAudio_put_Volume(This->basic_audio, v);
+    return S_OK;
 }
 
 static HRESULT WINAPI WMPSettings_getMode(IWMPSettings *iface, BSTR mode, VARIANT_BOOL *p)
@@ -1202,7 +1203,7 @@ static HRESULT WINAPI WMPNetwork_get_bufferingProgress(IWMPNetwork *iface, LONG 
 {
     WindowsMediaPlayer *This = impl_from_IWMPNetwork(iface);
     TRACE("(%p)->(%p)\n", This, plBufferingProgress);
-    if (!This->filter_graph) {
+    if (!This->mf_player) {
         return S_FALSE;
     }
     /* Ideally we would use IAMOpenProgress for URL reader but we don't have it in wine (yet)
@@ -1337,7 +1338,7 @@ static HRESULT WINAPI WMPNetwork_get_downloadProgress(IWMPNetwork *iface, LONG *
 {
     WindowsMediaPlayer *This = impl_from_IWMPNetwork(iface);
     TRACE("(%p)->(%p)\n", This, plDownloadProgress);
-    if (!This->filter_graph) {
+    if (!This->mf_player) {
         return S_FALSE;
     }
     /* Ideally we would use IAMOpenProgress for URL reader but we don't have it in wine (yet)
@@ -1469,13 +1470,12 @@ static HRESULT WINAPI WMPControls_get_isAvailable(IWMPControls *iface, BSTR bstr
 {
     WindowsMediaPlayer *This = impl_from_IWMPControls(iface);
     TRACE("(%p)->(%s %p)\n", This, debugstr_w(bstrItem), pIsAvailable);
-    if (!This->filter_graph) {
+    if (!This->mf_item) {
         *pIsAvailable = VARIANT_FALSE;
     } else if (wcscmp(L"currentPosition", bstrItem) == 0) {
-        DWORD capabilities;
-        IMediaSeeking_GetCapabilities(This->media_seeking, &capabilities);
-        *pIsAvailable = (capabilities & AM_SEEKING_CanSeekAbsolute) ?
-            VARIANT_TRUE : VARIANT_FALSE;
+        MFP_MEDIAITEM_CHARACTERISTICS characteristics = 0;
+        IMFPMediaItem_GetCharacteristics(This->mf_item, &characteristics);
+        *pIsAvailable = (characteristics & MFP_MEDIAITEM_CAN_SEEK) ? VARIANT_TRUE : VARIANT_FALSE;
     } else if (!wcsicmp(L"play", bstrItem) || !wcsicmp(L"stop", bstrItem) || !wcsicmp(L"pause", bstrItem)) {
         *pIsAvailable = VARIANT_TRUE;
     } else {
@@ -1639,6 +1639,167 @@ static WCHAR *resolve_media_url(const WCHAR *url)
     return current;
 }
 
+static void release_mf_player(WindowsMediaPlayer *This)
+{
+    if (This->mf_item)
+    {
+        IMFPMediaItem_Release(This->mf_item);
+        This->mf_item = NULL;
+    }
+    if (This->mf_player)
+    {
+        IMFPMediaPlayer_Shutdown(This->mf_player);
+        IMFPMediaPlayer_Release(This->mf_player);
+        This->mf_player = NULL;
+    }
+    This->item_set = This->play_pending = FALSE;
+    This->pending_position = This->seek_position = -1.0;
+}
+
+static HRESULT create_remote_media_item(WindowsMediaPlayer *This, const WCHAR *url, IMFPMediaItem **item)
+{
+    IMFSourceResolver *resolver = NULL;
+    IMFByteStream *byte_stream = NULL;
+    IMFAttributes *attributes;
+    WCHAR *content_type = NULL;
+    MF_OBJECT_TYPE type;
+    IUnknown *source = NULL;
+    IStream *stream;
+    HRESULT hr;
+
+    if (FAILED(hr = create_remote_stream(url, &stream, &content_type)))
+        return hr;
+    hr = MFCreateMFByteStreamOnStream(stream, &byte_stream);
+    IStream_Release(stream);
+    if (SUCCEEDED(hr) && SUCCEEDED(IMFByteStream_QueryInterface(byte_stream, &IID_IMFAttributes, (void **)&attributes)))
+    {
+        /* The URL has no usable extension (signed CDN URLs end in ?signature=...), so let the
+         * resolver pick a handler from the server's content type. */
+        IMFAttributes_SetString(attributes, &wmp_MF_BYTESTREAM_CONTENT_TYPE,
+                content_type && *content_type && wcsicmp(content_type, L"application/octet-stream")
+                ? content_type : L"audio/mpeg");
+        IMFAttributes_Release(attributes);
+    }
+    free(content_type);
+    if (SUCCEEDED(hr))
+        hr = MFCreateSourceResolver(&resolver);
+    if (SUCCEEDED(hr))
+        hr = IMFSourceResolver_CreateObjectFromByteStream(resolver, byte_stream, NULL,
+                MF_RESOLUTION_MEDIASOURCE | MF_RESOLUTION_CONTENT_DOES_NOT_HAVE_TO_MATCH_EXTENSION_OR_MIME_TYPE,
+                NULL, &type, &source);
+    if (SUCCEEDED(hr))
+        hr = IMFPMediaPlayer_CreateMediaItemFromObject(This->mf_player, source, TRUE, 0, item);
+    if (source)
+        IUnknown_Release(source);
+    if (resolver)
+        IMFSourceResolver_Release(resolver);
+    if (byte_stream)
+        IMFByteStream_Release(byte_stream);
+    return hr;
+}
+
+static HRESULT open_media(WindowsMediaPlayer *This)
+{
+    WCHAR *path = resolve_media_url(This->media->url);
+    const WCHAR *url = path ? path : This->media->url;
+    MFP_MEDIAITEM_CHARACTERISTICS characteristics = 0;
+    IMFPMediaItem *item = NULL;
+    PROPVARIANT duration;
+    HRESULT hr;
+
+    update_state(This, DISPID_WMPCOREEVENT_OPENSTATECHANGE, wmposOpeningUnknownURL);
+
+    hr = MFPCreateMediaPlayer(NULL, FALSE, 0, &This->IMFPMediaPlayerCallback_iface, This->hwnd, &This->mf_player);
+    if (SUCCEEDED(hr))
+    {
+        if (is_remote_url(url))
+            hr = create_remote_media_item(This, url, &item);
+        else
+            hr = IMFPMediaPlayer_CreateMediaItemFromURL(This->mf_player, url, TRUE, 0, &item);
+    }
+    if (FAILED(hr))
+        WARN("Failed to open %s, hr %#lx.\n", debugstr_w(url), hr);
+    free(path);
+
+    if (SUCCEEDED(hr))
+    {
+        This->mf_item = item;
+        if (SUCCEEDED(IMFPMediaItem_GetDuration(item, &MFP_POSITIONTYPE_100NS, &duration)))
+        {
+            if (duration.vt == VT_I8 || duration.vt == VT_UI8)
+                This->media->duration = (DOUBLE)duration.hVal.QuadPart / 10000000.0;
+            PropVariantClear(&duration);
+        }
+        IMFPMediaItem_GetCharacteristics(item, &characteristics);
+        TRACE("Opened media, duration %f, characteristics %#x.\n", This->media->duration, characteristics);
+        /* The item is set asynchronously; playback starts once MFP_EVENT_TYPE_MEDIAITEM_SET arrives. */
+        hr = IMFPMediaPlayer_SetMediaItem(This->mf_player, item);
+    }
+
+    if (FAILED(hr))
+    {
+        release_mf_player(This);
+        update_state(This, DISPID_WMPCOREEVENT_OPENSTATECHANGE, wmposPlaylistOpenNoMedia);
+    }
+    return hr;
+}
+
+static void apply_pending_position(WindowsMediaPlayer *This)
+{
+    PROPVARIANT position;
+
+    if (This->pending_position < 0.0)
+        return;
+    position.vt = VT_I8;
+    position.hVal.QuadPart = This->pending_position * 10000000.0;
+    This->pending_position = -1.0;
+    IMFPMediaPlayer_SetPosition(This->mf_player, &MFP_POSITIONTYPE_100NS, &position);
+}
+
+/* mfplay works asynchronously, but applications (and Wine's tests) expect play(), pause()
+ * and put_currentPosition() to take effect before they return, as with quartz. mfplay updates
+ * its state on the session's thread, so wait for it there without pumping messages. */
+static BOOL wait_for_item_set(WindowsMediaPlayer *This)
+{
+    IMFPMediaItem *item;
+    DWORD start = GetTickCount();
+
+    do
+    {
+        if (SUCCEEDED(IMFPMediaPlayer_GetMediaItem(This->mf_player, &item)))
+        {
+            IMFPMediaItem_Release(item);
+            return TRUE;
+        }
+        Sleep(5);
+    } while (GetTickCount() - start < 10000);
+    WARN("Timed out waiting for the media item to be set.\n");
+    return FALSE;
+}
+
+static BOOL wait_for_state(WindowsMediaPlayer *This, MFP_MEDIAPLAYER_STATE wanted)
+{
+    MFP_MEDIAPLAYER_STATE state;
+    DWORD start = GetTickCount();
+
+    do
+    {
+        if (SUCCEEDED(IMFPMediaPlayer_GetState(This->mf_player, &state)) && state == wanted)
+            return TRUE;
+        Sleep(5);
+    } while (GetTickCount() - start < 10000);
+    WARN("Timed out waiting for state %u.\n", wanted);
+    return FALSE;
+}
+
+static void media_item_ready(WindowsMediaPlayer *This)
+{
+    This->item_set = TRUE;
+    IWMPSettings_put_volume(&This->IWMPSettings_iface, This->volume);
+    update_state(This, DISPID_WMPCOREEVENT_OPENSTATECHANGE, wmposMediaOpen);
+    apply_pending_position(This);
+}
+
 static HRESULT WINAPI WMPControls_play(IWMPControls *iface)
 {
     HRESULT hres = S_OK;
@@ -1650,132 +1811,50 @@ static HRESULT WINAPI WMPControls_play(IWMPControls *iface)
         return NS_S_WMPCORE_COMMAND_NOT_AVAILABLE;
     }
 
-    if (!This->filter_graph) {
-        hres = CoCreateInstance(&CLSID_FilterGraph,
-                NULL,
-                CLSCTX_INPROC_SERVER,
-                &IID_IGraphBuilder,
-                (void **)&This->filter_graph);
-        update_state(This, DISPID_WMPCOREEVENT_OPENSTATECHANGE, wmposOpeningUnknownURL);
-
-        if (SUCCEEDED(hres))
+    if (!This->mf_player)
+    {
+        if (FAILED(hres = open_media(This)))
         {
-            WCHAR *path = resolve_media_url(This->media->url);
-
-            hres = IGraphBuilder_RenderFile(This->filter_graph, path ? path : This->media->url, NULL);
-            free(path);
+            update_state(This, DISPID_WMPCOREEVENT_PLAYSTATECHANGE, wmppsUndefined);
+            return hres;
         }
-        if (SUCCEEDED(hres))
-            update_state(This, DISPID_WMPCOREEVENT_OPENSTATECHANGE, wmposMediaOpen);
-        if (SUCCEEDED(hres))
-            hres = IGraphBuilder_QueryInterface(This->filter_graph, &IID_IMediaControl,
-                    (void**)&This->media_control);
-        if (SUCCEEDED(hres))
-            hres = IGraphBuilder_QueryInterface(This->filter_graph, &IID_IMediaSeeking,
-                    (void**)&This->media_seeking);
-        if (SUCCEEDED(hres))
-            hres = IMediaSeeking_SetTimeFormat(This->media_seeking, &TIME_FORMAT_MEDIA_TIME);
-        if (SUCCEEDED(hres))
-            hres = IGraphBuilder_QueryInterface(This->filter_graph, &IID_IMediaEvent,
-                    (void**)&This->media_event);
-        if (SUCCEEDED(hres))
-        {
-            IMediaEventEx *media_event_ex = NULL;
-            hres = IGraphBuilder_QueryInterface(This->filter_graph, &IID_IMediaEventEx,
-                    (void**)&media_event_ex);
-            if (SUCCEEDED(hres)) {
-                hres = IMediaEventEx_SetNotifyWindow(media_event_ex, (OAHWND)This->msg_window,
-                        WM_WMPEVENT, (LONG_PTR)This);
-                IMediaEventEx_Release(media_event_ex);
-            }
-        }
-        if (SUCCEEDED(hres))
-            hres = IGraphBuilder_QueryInterface(This->filter_graph, &IID_IBasicAudio, (void**)&This->basic_audio);
-        if (SUCCEEDED(hres))
-            hres = IWMPSettings_put_volume(&This->IWMPSettings_iface, This->volume);
-
-        if (FAILED(hres))
-        {
-            if (This->filter_graph)
-            {
-                IGraphBuilder_Release(This->filter_graph);
-                This->filter_graph = NULL;
-            }
-            if (This->media_control)
-            {
-                IMediaControl_Release(This->media_control);
-                This->media_control = NULL;
-            }
-            if (This->media_seeking)
-            {
-                IMediaSeeking_Release(This->media_seeking);
-                This->media_seeking = NULL;
-            }
-            if (This->media_event)
-            {
-                IMediaEvent_Release(This->media_event);
-                This->media_event = NULL;
-            }
-            if (This->basic_audio)
-            {
-                IBasicAudio_Release(This->basic_audio);
-                This->basic_audio = NULL;
-            }
-        }
+        if (wait_for_item_set(This))
+            media_item_ready(This);
     }
 
     update_state(This, DISPID_WMPCOREEVENT_PLAYSTATECHANGE, wmppsTransitioning);
 
-    if (SUCCEEDED(hres))
-        hres = IMediaControl_Run(This->media_control);
-
-    if (hres == S_FALSE) {
-        hres = S_OK; /* S_FALSE will mean that graph is transitioning and that is fine */
+    if (!This->item_set)
+    {
+        /* still opening; MFP_EVENT_TYPE_MEDIAITEM_SET starts playback */
+        This->play_pending = TRUE;
+        return S_OK;
     }
 
-    if (SUCCEEDED(hres)) {
-        LONGLONG duration;
-        update_state(This, DISPID_WMPCOREEVENT_PLAYSTATECHANGE, wmppsPlaying);
-        if (SUCCEEDED(IMediaSeeking_GetDuration(This->media_seeking, &duration)))
-            This->media->duration = (DOUBLE)duration / 10000000.0f;
-    } else {
+    if (FAILED(hres = IMFPMediaPlayer_Play(This->mf_player)))
+    {
         update_state(This, DISPID_WMPCOREEVENT_PLAYSTATECHANGE, wmppsUndefined);
+        return hres;
     }
-
-    return hres;
+    if (wait_for_state(This, MFP_MEDIAPLAYER_STATE_PLAYING))
+        update_state(This, DISPID_WMPCOREEVENT_PLAYSTATECHANGE, wmppsPlaying);
+    return S_OK;
 }
 
 static HRESULT WINAPI WMPControls_stop(IWMPControls *iface)
 {
-    HRESULT hres = S_OK;
     WindowsMediaPlayer *This = impl_from_IWMPControls(iface);
     TRACE("(%p)\n", This);
-    if (!This->filter_graph) {
+    if (!This->mf_player) {
         return NS_S_WMPCORE_COMMAND_NOT_AVAILABLE;
     }
-    if (This->media_control) {
-        hres = IMediaControl_Stop(This->media_control);
-        IMediaControl_Release(This->media_control);
-    }
-    if (This->media_event) {
-        IMediaEvent_Release(This->media_event);
-    }
-    if (This->media_seeking) {
-        IMediaSeeking_Release(This->media_seeking);
-    }
-    if (This->basic_audio) {
-        IBasicAudio_Release(This->basic_audio);
-    }
-    IGraphBuilder_Release(This->filter_graph);
-    This->filter_graph = NULL;
-    This->media_control = NULL;
-    This->media_event = NULL;
-    This->media_seeking = NULL;
-    This->basic_audio = NULL;
+    if (This->item_set)
+        IMFPMediaPlayer_Stop(This->mf_player);
+    release_mf_player(This);
 
     update_state(This, DISPID_WMPCOREEVENT_OPENSTATECHANGE, wmposPlaylistOpenNoMedia);
     update_state(This, DISPID_WMPCOREEVENT_PLAYSTATECHANGE, wmppsStopped);
-    return hres;
+    return S_OK;
 }
 
 static HRESULT WINAPI WMPControls_pause(IWMPControls *iface)
@@ -1784,11 +1863,18 @@ static HRESULT WINAPI WMPControls_pause(IWMPControls *iface)
     HRESULT hres;
 
     TRACE("(%p)\n", This);
-    if (!This->media_control)
+    if (!This->mf_player)
         return NS_S_WMPCORE_COMMAND_NOT_AVAILABLE;
-    if (FAILED(hres = IMediaControl_Pause(This->media_control)))
+    if (!This->item_set)
+    {
+        This->play_pending = FALSE;
+        update_state(This, DISPID_WMPCOREEVENT_PLAYSTATECHANGE, wmppsPaused);
+        return S_OK;
+    }
+    if (FAILED(hres = IMFPMediaPlayer_Pause(This->mf_player)))
         return hres;
-    update_state(This, DISPID_WMPCOREEVENT_PLAYSTATECHANGE, wmppsPaused);
+    if (wait_for_state(This, MFP_MEDIAPLAYER_STATE_PAUSED))
+        update_state(This, DISPID_WMPCOREEVENT_PLAYSTATECHANGE, wmppsPaused);
     return S_OK;
 }
 
@@ -1809,33 +1895,58 @@ static HRESULT WINAPI WMPControls_fastReverse(IWMPControls *iface)
 static HRESULT WINAPI WMPControls_get_currentPosition(IWMPControls *iface, DOUBLE *pdCurrentPosition)
 {
     WindowsMediaPlayer *This = impl_from_IWMPControls(iface);
+    PROPVARIANT position;
     HRESULT hres;
-    LONGLONG currentPosition;
 
     TRACE("(%p)->(%p)\n", This, pdCurrentPosition);
-    if (!This->media_seeking)
+    if (!This->mf_player)
         return S_FALSE;
 
-    hres = IMediaSeeking_GetCurrentPosition(This->media_seeking, &currentPosition);
-    *pdCurrentPosition = (DOUBLE) currentPosition / 10000000.0f;
+    if (!This->item_set || This->seek_position >= 0.0)
+    {
+        double pos = This->item_set ? This->seek_position : This->pending_position;
+        *pdCurrentPosition = pos < 0.0 ? 0.0 : pos;
+        return S_OK;
+    }
+
+    if (SUCCEEDED(hres = IMFPMediaPlayer_GetPosition(This->mf_player, &MFP_POSITIONTYPE_100NS, &position)))
+    {
+        *pdCurrentPosition = (position.vt == VT_I8 || position.vt == VT_UI8) ? (DOUBLE)position.hVal.QuadPart / 10000000.0 : 0.0;
+        PropVariantClear(&position);
+    }
+    else
+    {
+        /* e.g. stopped at the end */
+        *pdCurrentPosition = 0.0;
+        hres = S_OK;
+    }
     TRACE("hres: %ld, pos: %f\n", hres, *pdCurrentPosition);
     return hres;
 }
 
 static HRESULT WINAPI WMPControls_put_currentPosition(IWMPControls *iface, DOUBLE dCurrentPosition)
 {
-    LONGLONG Current;
-    HRESULT hres;
     WindowsMediaPlayer *This = impl_from_IWMPControls(iface);
+    PROPVARIANT position;
+    HRESULT hres;
+
     TRACE("(%p)->(%f)\n", This, dCurrentPosition);
-    if (!This->media_seeking)
+    if (!This->mf_player)
         return S_FALSE;
 
-    Current = 10000000 * dCurrentPosition;
-    hres = IMediaSeeking_SetPositions(This->media_seeking, &Current,
-            AM_SEEKING_AbsolutePositioning, NULL, AM_SEEKING_NoPositioning);
+    if (!This->item_set)
+    {
+        This->pending_position = max(dCurrentPosition, 0.0);
+        return S_OK;
+    }
 
-    return hres;
+    position.vt = VT_I8;
+    position.hVal.QuadPart = max(dCurrentPosition, 0.0) * 10000000.0;
+    if (FAILED(hres = IMFPMediaPlayer_SetPosition(This->mf_player, &MFP_POSITIONTYPE_100NS, &position)))
+        return hres;
+    /* report the new position until the seek has completed */
+    This->seek_position = max(dCurrentPosition, 0.0);
+    return S_OK;
 }
 
 static HRESULT WINAPI WMPControls_get_currentPositionString(IWMPControls *iface, BSTR *pbstrCurrentPosition)
@@ -2388,31 +2499,102 @@ static const IWMPPlaylistVtbl WMPPlaylistVtbl = {
 
 static LRESULT WINAPI player_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-    if (msg == WM_WMPEVENT && wParam == 0) {
-        WindowsMediaPlayer *wmp = (WindowsMediaPlayer*)lParam;
-        LONG event_code;
-        LONG_PTR p1, p2;
-        HRESULT hr;
-        if (wmp->media_event) {
-            do {
-                hr = IMediaEvent_GetEvent(wmp->media_event, &event_code, &p1, &p2, 0);
-                if (SUCCEEDED(hr)) {
-                    TRACE("got event_code = 0x%02lx\n", event_code);
-                    IMediaEvent_FreeEventParams(wmp->media_event, event_code, p1, p2);
-                    /* For now we only handle EC_COMPLETE */
-                    if (event_code == EC_COMPLETE) {
-                        update_state(wmp, DISPID_WMPCOREEVENT_PLAYSTATECHANGE, wmppsMediaEnded);
-                        update_state(wmp, DISPID_WMPCOREEVENT_PLAYSTATECHANGE, wmppsTransitioning);
-                        update_state(wmp, DISPID_WMPCOREEVENT_PLAYSTATECHANGE, wmppsStopped);
-                    }
-                }
-            } while (hr == S_OK);
-        } else {
-            FIXME("Got event from quartz when interfaces are already released\n");
-        }
-    }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
+
+static inline WindowsMediaPlayer *impl_from_IMFPMediaPlayerCallback(IMFPMediaPlayerCallback *iface)
+{
+    return CONTAINING_RECORD(iface, WindowsMediaPlayer, IMFPMediaPlayerCallback_iface);
+}
+
+static HRESULT WINAPI mfp_callback_QueryInterface(IMFPMediaPlayerCallback *iface, REFIID riid, void **out)
+{
+    if (IsEqualIID(riid, &IID_IMFPMediaPlayerCallback) || IsEqualIID(riid, &IID_IUnknown))
+    {
+        *out = iface;
+        return S_OK;
+    }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+/* The callback lives as long as the player object, which shuts mfplay down first. */
+static ULONG WINAPI mfp_callback_AddRef(IMFPMediaPlayerCallback *iface)
+{
+    return 2;
+}
+
+static ULONG WINAPI mfp_callback_Release(IMFPMediaPlayerCallback *iface)
+{
+    return 1;
+}
+
+/* mfplay delivers these on the thread that created the player, through its window. */
+static void WINAPI mfp_callback_OnMediaPlayerEvent(IMFPMediaPlayerCallback *iface, MFP_EVENT_HEADER *header)
+{
+    WindowsMediaPlayer *This = impl_from_IMFPMediaPlayerCallback(iface);
+
+    TRACE("event %u, hr %#lx, state %u.\n", header->eEventType, header->hrEvent, header->eState);
+
+    if (header->pMediaPlayer != This->mf_player)
+        return;
+
+    switch (header->eEventType)
+    {
+        case MFP_EVENT_TYPE_MEDIAITEM_SET:
+            if (FAILED(header->hrEvent))
+            {
+                WARN("Failed to set media item, hr %#lx.\n", header->hrEvent);
+                update_state(This, DISPID_WMPCOREEVENT_OPENSTATECHANGE, wmposPlaylistOpenNoMedia);
+                update_state(This, DISPID_WMPCOREEVENT_PLAYSTATECHANGE, wmppsUndefined);
+                break;
+            }
+            if (!This->item_set)
+                media_item_ready(This);
+            if (This->play_pending)
+            {
+                This->play_pending = FALSE;
+                if (FAILED(IMFPMediaPlayer_Play(This->mf_player)))
+                    update_state(This, DISPID_WMPCOREEVENT_PLAYSTATECHANGE, wmppsUndefined);
+            }
+            break;
+
+        case MFP_EVENT_TYPE_PLAY:
+            if (SUCCEEDED(header->hrEvent) && This->play_state != wmppsPlaying)
+                update_state(This, DISPID_WMPCOREEVENT_PLAYSTATECHANGE, wmppsPlaying);
+            break;
+
+        case MFP_EVENT_TYPE_PAUSE:
+            if (SUCCEEDED(header->hrEvent) && This->play_state != wmppsPaused)
+                update_state(This, DISPID_WMPCOREEVENT_PLAYSTATECHANGE, wmppsPaused);
+            break;
+
+        case MFP_EVENT_TYPE_POSITION_SET:
+            This->seek_position = -1.0;
+            break;
+
+        case MFP_EVENT_TYPE_PLAYBACK_ENDED:
+            update_state(This, DISPID_WMPCOREEVENT_PLAYSTATECHANGE, wmppsMediaEnded);
+            update_state(This, DISPID_WMPCOREEVENT_PLAYSTATECHANGE, wmppsTransitioning);
+            update_state(This, DISPID_WMPCOREEVENT_PLAYSTATECHANGE, wmppsStopped);
+            break;
+
+        case MFP_EVENT_TYPE_ERROR:
+            WARN("Playback error, hr %#lx.\n", header->hrEvent);
+            break;
+
+        default:
+            break;
+    }
+}
+
+static const IMFPMediaPlayerCallbackVtbl mfp_callback_vtbl =
+{
+    mfp_callback_QueryInterface,
+    mfp_callback_AddRef,
+    mfp_callback_Release,
+    mfp_callback_OnMediaPlayerEvent,
+};
 
 static BOOL WINAPI register_player_msg_class(INIT_ONCE *once, void *param, void **context) {
     static WNDCLASSEXW wndclass = {
@@ -2454,6 +2636,8 @@ BOOL init_player(WindowsMediaPlayer *wmp)
     wmp->IWMPSettings_iface.lpVtbl = &WMPSettingsVtbl;
     wmp->IWMPControls_iface.lpVtbl = &WMPControlsVtbl;
     wmp->IWMPNetwork_iface.lpVtbl = &WMPNetworkVtbl;
+    wmp->IMFPMediaPlayerCallback_iface.lpVtbl = &mfp_callback_vtbl;
+    wmp->pending_position = wmp->seek_position = -1.0;
 
     name = SysAllocString(L"Playlist1");
     if (SUCCEEDED(create_playlist(name, NULL, 0, &playlist)))

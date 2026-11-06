@@ -21,6 +21,9 @@
 #include "windows.h"
 #include "ole2.h"
 #include "dshow.h"
+#include "mfapi.h"
+#include "mfidl.h"
+#include "mfplay.h"
 #include "wmp.h"
 
 #define TID_LIST \
@@ -102,12 +105,14 @@ struct WindowsMediaPlayer {
     WMPMedia *media;
     WMPPlaylist *playlist;
 
-    /* DirectShow stuff */
-    IGraphBuilder* filter_graph;
-    IMediaControl* media_control;
-    IMediaEvent* media_event;
-    IMediaSeeking* media_seeking;
-    IBasicAudio* basic_audio;
+    /* Playback goes through Media Foundation (mfplay), like native WMP 12. */
+    IMFPMediaPlayerCallback IMFPMediaPlayerCallback_iface;
+    IMFPMediaPlayer *mf_player;
+    IMFPMediaItem *mf_item;
+    BOOL item_set;      /* the player has the item and can be controlled */
+    BOOL play_pending;  /* play() was called before the item was set */
+    double pending_position; /* put_currentPosition() before the item was set */
+    double seek_position;    /* reported while a seek completes */
 
     /* Async event notification */
     HWND msg_window;
@@ -127,6 +132,9 @@ HRESULT WINAPI WMPFactory_CreateInstance(IClassFactory*,IUnknown*,REFIID,void**)
 
 void unregister_wmp_class(void);
 void unregister_player_msg_class(void);
+
+BOOL is_remote_url(const WCHAR *url);
+HRESULT create_remote_stream(const WCHAR *url, IStream **out, WCHAR **content_type);
 
 extern HINSTANCE wmp_instance;
 
