@@ -22,6 +22,7 @@
 #include <nserror.h>
 #include "wmpids.h"
 #include "shlwapi.h"
+#include "urlmon.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(wmp);
 
@@ -1460,6 +1461,170 @@ static HRESULT WINAPI WMPControls_get_isAvailable(IWMPControls *iface, BSTR bstr
     return S_OK;
 }
 
+/* Wine's quartz has no URL reader, so http(s) media is fetched into the
+ * urlmon cache and played from there.
+ * FIXME: this downloads the whole file before playback starts. */
+static WCHAR *download_url(const WCHAR *url)
+{
+    WCHAR path[MAX_PATH];
+    HRESULT hr;
+
+    TRACE("Downloading %s.\n", debugstr_w(url));
+    hr = URLDownloadToCacheFileW(NULL, url, path, ARRAY_SIZE(path), 0, NULL);
+    if (FAILED(hr))
+    {
+        WARN("Failed to download %s, hr %#lx.\n", debugstr_w(url), hr);
+        return NULL;
+    }
+    TRACE("Downloaded to %s.\n", debugstr_w(path));
+    return wcsdup(path);
+}
+
+static BOOL is_remote_url(const WCHAR *url)
+{
+    return !wcsnicmp(url, L"http://", 7) || !wcsnicmp(url, L"https://", 8);
+}
+
+static BOOL is_asx_url(const WCHAR *url)
+{
+    const WCHAR *end = url + wcscspn(url, L"?#"), *ext = end;
+
+    while (ext > url && ext[-1] != '.' && ext[-1] != '/' && ext[-1] != '\\') --ext;
+    if (ext == url || ext[-1] != '.') return FALSE;
+    return (end - ext == 3 && (!wcsnicmp(ext, L"asx", 3) || !wcsnicmp(ext, L"wax", 3) || !wcsnicmp(ext, L"wvx", 3)));
+}
+
+static void decode_xml_entities(WCHAR *str)
+{
+    static const struct { const WCHAR *name; WCHAR ch; } entities[] =
+    {
+        {L"&amp;", '&'}, {L"&lt;", '<'}, {L"&gt;", '>'}, {L"&quot;", '"'}, {L"&apos;", '\''},
+    };
+    WCHAR *src = str, *dst = str;
+    unsigned int i;
+
+    while (*src)
+    {
+        if (*src == '&')
+        {
+            for (i = 0; i < ARRAY_SIZE(entities); ++i)
+            {
+                size_t len = wcslen(entities[i].name);
+                if (!wcsnicmp(src, entities[i].name, len))
+                {
+                    *dst++ = entities[i].ch;
+                    src += len;
+                    break;
+                }
+            }
+            if (i < ARRAY_SIZE(entities)) continue;
+        }
+        *dst++ = *src++;
+    }
+    *dst = 0;
+}
+
+/* Returns the first <ref href="..."> entry of an ASX playlist file.
+ * FIXME: only the first entry is played; the rest of the playlist is ignored. */
+static WCHAR *get_asx_first_ref(const WCHAR *file)
+{
+    WCHAR *text = NULL, *p, *ret = NULL;
+    char *data = NULL;
+    DWORD size, read;
+    HANDLE handle;
+    int len;
+
+    handle = CreateFileW(file, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (handle == INVALID_HANDLE_VALUE)
+    {
+        WARN("Failed to open playlist %s, error %lu.\n", debugstr_w(file), GetLastError());
+        return NULL;
+    }
+    size = GetFileSize(handle, NULL);
+    if (size != INVALID_FILE_SIZE && size < 1024 * 1024 && (data = malloc(size + 1))
+            && ReadFile(handle, data, size, &read, NULL))
+    {
+        const char *start = data;
+
+        data[read] = 0;
+        if (read >= 3 && !memcmp(data, "\xef\xbb\xbf", 3)) start += 3;
+        if ((len = MultiByteToWideChar(CP_UTF8, 0, start, -1, NULL, 0)) && (text = malloc(len * sizeof(WCHAR))))
+            MultiByteToWideChar(CP_UTF8, 0, start, -1, text, len);
+    }
+    CloseHandle(handle);
+    free(data);
+    if (!text) return NULL;
+
+    for (p = text; (p = wcschr(p, '<')); ++p)
+    {
+        WCHAR *attr, quote, *value, *end;
+
+        if (wcsnicmp(p + 1, L"ref", 3) || !iswspace(p[4])) continue;
+        end = wcschr(p, '>');
+        for (attr = p + 4; *attr && attr != end; ++attr)
+        {
+            if (wcsnicmp(attr, L"href", 4) || !(iswspace(attr[-1]))) continue;
+            value = attr + 4;
+            while (iswspace(*value)) ++value;
+            if (*value++ != '=') continue;
+            while (iswspace(*value)) ++value;
+            quote = *value;
+            if (quote != '"' && quote != '\'') continue;
+            ++value;
+            if (!(end = wcschr(value, quote))) break;
+            *end = 0;
+            ret = wcsdup(value);
+            decode_xml_entities(ret);
+            break;
+        }
+        if (ret) break;
+    }
+    free(text);
+
+    if (ret && !wcschr(ret, ':') && ret[0] != '\\')
+    {
+        /* relative entry: resolve against the playlist's folder */
+        WCHAR *full = malloc((wcslen(file) + wcslen(ret) + 2) * sizeof(WCHAR));
+        if (full)
+        {
+            wcscpy(full, file);
+            PathRemoveFileSpecW(full);
+            PathAppendW(full, ret);
+        }
+        free(ret);
+        ret = full;
+    }
+    TRACE("Playlist %s, first entry %s.\n", debugstr_w(file), debugstr_w(ret));
+    return ret;
+}
+
+/* Turns a media URL into something quartz can open: a local file. */
+static WCHAR *resolve_media_url(const WCHAR *url)
+{
+    WCHAR *current = wcsdup(url), *next;
+    unsigned int depth;
+
+    for (depth = 0; current && depth < 4; ++depth)
+    {
+        if (is_remote_url(current))
+        {
+            next = download_url(current);
+            free(current);
+            current = next;
+        }
+        if (current && is_asx_url(current))
+        {
+            next = get_asx_first_ref(current);
+            free(current);
+            current = next;
+            continue;
+        }
+        return current;
+    }
+    free(current);
+    return NULL;
+}
+
 static HRESULT WINAPI WMPControls_play(IWMPControls *iface)
 {
     HRESULT hres = S_OK;
@@ -1480,7 +1645,12 @@ static HRESULT WINAPI WMPControls_play(IWMPControls *iface)
         update_state(This, DISPID_WMPCOREEVENT_OPENSTATECHANGE, wmposOpeningUnknownURL);
 
         if (SUCCEEDED(hres))
-            hres = IGraphBuilder_RenderFile(This->filter_graph, This->media->url, NULL);
+        {
+            WCHAR *path = resolve_media_url(This->media->url);
+
+            hres = IGraphBuilder_RenderFile(This->filter_graph, path ? path : This->media->url, NULL);
+            free(path);
+        }
         if (SUCCEEDED(hres))
             update_state(This, DISPID_WMPCOREEVENT_OPENSTATECHANGE, wmposMediaOpen);
         if (SUCCEEDED(hres))
