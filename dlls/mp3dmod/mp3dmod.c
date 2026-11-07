@@ -592,6 +592,19 @@ static HRESULT WINAPI MediaObject_ProcessOutput(IMediaObject *iface, DWORD flags
         }
 
         while ((err = mpg123_read(This->mh, data + len, framesize, &written)) == MPG123_NEW_FORMAT);
+
+        /* MPEG-2 and 2.5 layer 3 frames hold 576 samples, so a read of 1152 samples can return
+         * half a buffer with MPG123_NEED_MORE. Keep that audio; it used to be dropped, and
+         * 22050 Hz files played nothing. */
+        if (written)
+        {
+            got_data = 1;
+            len += written;
+            hr = IMediaBuffer_SetLength(buffers[0].pBuffer, len);
+            if (FAILED(hr)) return hr;
+            time += frametime * written / framesize;
+        }
+
         if (err == MPG123_NEED_MORE)
         {
             IMediaBuffer_Release(This->buffer);
@@ -604,14 +617,8 @@ static HRESULT WINAPI MediaObject_ProcessOutput(IMediaObject *iface, DWORD flags
             ERR("mpg123_read() returned %d\n", err);
         if (written < framesize)
             ERR("short write: %Id/%lu\n", written, framesize);
-
-        got_data = 1;
-
-        len += framesize;
-        hr = IMediaBuffer_SetLength(buffers[0].pBuffer, len);
-        if (FAILED(hr)) return hr;
-
-        time += frametime;
+        if (!written)
+            break;
     }
 
     if (got_data)
