@@ -113,6 +113,9 @@ struct WindowsMediaPlayer {
     BOOL play_pending;  /* play() was called before the item was set */
     double pending_position; /* put_currentPosition() before the item was set */
     double seek_position;    /* reported while a seek completes */
+    double seek_from;        /* position before the seek, for PositionChange */
+    unsigned int pending_seeks;
+    BOOL async_play;         /* play started from the MEDIAITEM_SET callback */
 
     /* Async event notification */
     HWND msg_window;
