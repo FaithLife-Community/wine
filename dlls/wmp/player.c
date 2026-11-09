@@ -55,6 +55,25 @@ static void update_state(WindowsMediaPlayer *wmp, LONG type, LONG state)
     call_sink(wmp->wmpocx, type, &dispparams);
 }
 
+static void fire_position_change(WindowsMediaPlayer *wmp, double old_position, double new_position)
+{
+    DISPPARAMS dispparams;
+    VARIANTARG params[2];
+
+    dispparams.cArgs = 2;
+    dispparams.cNamedArgs = 0;
+    dispparams.rgdispidNamedArgs = NULL;
+    dispparams.rgvarg = params;
+
+    /* PositionChange(oldPosition, newPosition), arguments in reverse order */
+    V_VT(&params[0]) = VT_R8;
+    V_R8(&params[0]) = new_position;
+    V_VT(&params[1]) = VT_R8;
+    V_R8(&params[1]) = old_position;
+
+    call_sink(wmp->wmpocx, DISPID_WMPCOREEVENT_POSITIONCHANGE, &dispparams);
+}
+
 static inline WMPPlaylist *impl_from_IWMPPlaylist(IWMPPlaylist *iface)
 {
     return CONTAINING_RECORD(iface, WMPPlaylist, IWMPPlaylist_iface);
@@ -1652,7 +1671,8 @@ static void release_mf_player(WindowsMediaPlayer *This)
         IMFPMediaPlayer_Release(This->mf_player);
         This->mf_player = NULL;
     }
-    This->item_set = This->play_pending = FALSE;
+    This->item_set = This->play_pending = This->async_play = FALSE;
+    This->pending_seeks = 0;
     This->pending_position = This->seek_position = -1.0;
 }
 
@@ -1753,7 +1773,8 @@ static void apply_pending_position(WindowsMediaPlayer *This)
     position.vt = VT_I8;
     position.hVal.QuadPart = This->pending_position * 10000000.0;
     This->pending_position = -1.0;
-    IMFPMediaPlayer_SetPosition(This->mf_player, &MFP_POSITIONTYPE_100NS, &position);
+    if (SUCCEEDED(IMFPMediaPlayer_SetPosition(This->mf_player, &MFP_POSITIONTYPE_100NS, &position)))
+        ++This->pending_seeks;
 }
 
 /* mfplay works asynchronously, but applications (and Wine's tests) expect play(), pause()
@@ -1942,10 +1963,12 @@ static HRESULT WINAPI WMPControls_put_currentPosition(IWMPControls *iface, DOUBL
 
     position.vt = VT_I8;
     position.hVal.QuadPart = max(dCurrentPosition, 0.0) * 10000000.0;
+    IWMPControls_get_currentPosition(iface, &This->seek_from);
     if (FAILED(hres = IMFPMediaPlayer_SetPosition(This->mf_player, &MFP_POSITIONTYPE_100NS, &position)))
         return hres;
     /* report the new position until the seek has completed */
     This->seek_position = max(dCurrentPosition, 0.0);
+    ++This->pending_seeks;
     return S_OK;
 }
 
@@ -2554,23 +2577,36 @@ static void WINAPI mfp_callback_OnMediaPlayerEvent(IMFPMediaPlayerCallback *ifac
             if (This->play_pending)
             {
                 This->play_pending = FALSE;
+                This->async_play = TRUE;
                 if (FAILED(IMFPMediaPlayer_Play(This->mf_player)))
                     update_state(This, DISPID_WMPCOREEVENT_PLAYSTATECHANGE, wmppsUndefined);
             }
             break;
 
+        /* play() and pause() report their state themselves before returning; these events
+         * arrive later through the message queue and may be stale, e.g. a PAUSE event after
+         * the application already resumed, which left it thinking playback was paused.
+         * Only a play started from MFP_EVENT_TYPE_MEDIAITEM_SET is reported here. */
         case MFP_EVENT_TYPE_PLAY:
-            if (SUCCEEDED(header->hrEvent) && This->play_state != wmppsPlaying)
-                update_state(This, DISPID_WMPCOREEVENT_PLAYSTATECHANGE, wmppsPlaying);
+            if (This->async_play)
+            {
+                This->async_play = FALSE;
+                if (SUCCEEDED(header->hrEvent) && This->play_state != wmppsPlaying)
+                    update_state(This, DISPID_WMPCOREEVENT_PLAYSTATECHANGE, wmppsPlaying);
+            }
             break;
 
         case MFP_EVENT_TYPE_PAUSE:
-            if (SUCCEEDED(header->hrEvent) && This->play_state != wmppsPaused)
-                update_state(This, DISPID_WMPCOREEVENT_PLAYSTATECHANGE, wmppsPaused);
             break;
 
         case MFP_EVENT_TYPE_POSITION_SET:
-            This->seek_position = -1.0;
+            if (This->pending_seeks && !--This->pending_seeks && This->seek_position >= 0.0)
+            {
+                double new_position = This->seek_position;
+
+                This->seek_position = -1.0;
+                fire_position_change(This, This->seek_from, new_position);
+            }
             break;
 
         case MFP_EVENT_TYPE_PLAYBACK_ENDED:
