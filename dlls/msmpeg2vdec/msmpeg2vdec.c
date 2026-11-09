@@ -19,10 +19,55 @@
 #include "video_decoder.h"
 
 #include "rpcproxy.h"
+#include "winreg.h"
 
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(dmo);
+
+extern HRESULT ffmpeg_h264_decoder_create(REFIID riid, void **out);
+
+/* FFmpeg decoders are used when Wine's FFmpeg media source is enabled, or
+ * when they are asked for explicitly; GStreamer stays the fallback. */
+static BOOL use_ffmpeg_decoders(void)
+{
+    DWORD value, size = sizeof(value);
+
+    if (!RegGetValueW(HKEY_CURRENT_USER, L"Software\\Wine\\MediaFoundation", L"DisableGstDecoders",
+            RRF_RT_REG_DWORD, NULL, &value, &size))
+        return !!value;
+    size = sizeof(value);
+    if (!RegGetValueW(HKEY_CURRENT_USER, L"Software\\Wine\\MediaFoundation", L"DisableGstByteStreamHandler",
+            RRF_RT_REG_DWORD, NULL, &value, &size))
+        return !!value;
+    return FALSE;
+}
+
+static HRESULT WINAPI h264_factory_CreateInstance(IClassFactory *iface, IUnknown *outer, REFIID riid, void **out)
+{
+    BOOL ffmpeg = use_ffmpeg_decoders();
+    HRESULT hr;
+
+    TRACE("outer %p, riid %s, out %p, ffmpeg %u.\n", outer, debugstr_guid(riid), out, ffmpeg);
+
+    if (ffmpeg && !outer && SUCCEEDED(hr = ffmpeg_h264_decoder_create(riid, out)))
+        return hr;
+    if (SUCCEEDED(hr = IClassFactory_CreateInstance(&h264_decoder_factory, outer, riid, out)) || ffmpeg || outer)
+        return hr;
+    /* GStreamer or its H.264 plugin is missing, try FFmpeg */
+    return ffmpeg_h264_decoder_create(riid, out);
+}
+
+static const IClassFactoryVtbl h264_factory_vtbl =
+{
+    class_factory_QueryInterface,
+    class_factory_AddRef,
+    class_factory_Release,
+    h264_factory_CreateInstance,
+    class_factory_LockServer,
+};
+
+static IClassFactory h264_factory = {&h264_factory_vtbl};
 
 /***********************************************************************
  *              DllGetClassObject (msmpeg2vdec.@)
@@ -30,7 +75,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(dmo);
 HRESULT WINAPI DllGetClassObject(REFCLSID clsid, REFIID riid, void **out)
 {
     if (IsEqualGUID(clsid, &CLSID_MSH264DecoderMFT))
-        return IClassFactory_QueryInterface(&h264_decoder_factory, riid, out);
+        return IClassFactory_QueryInterface(&h264_factory, riid, out);
 
     *out = NULL;
     FIXME("Unknown clsid %s.\n", debugstr_guid(clsid));

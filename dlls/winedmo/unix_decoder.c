@@ -429,6 +429,9 @@ static NTSTATUS write_audio_frame( const AVFrame *frame, const struct winedmo_fr
     BOOL is_float = IsEqualGUID( &format->subtype, &MFAudioFormat_Float );
     UINT needed = frame->nb_samples * channels * (is_float ? sizeof(float) : sizeof(INT16));
 
+    TRACE( "%d samples, %d channels, %s, writing %s\n", frame->nb_samples, channels,
+           av_get_sample_fmt_name( frame->format ), is_float ? "float" : "16-bit" );
+
     if (frame->format != AV_SAMPLE_FMT_FLTP && frame->format != AV_SAMPLE_FMT_FLT && frame->format != AV_SAMPLE_FMT_DBLP
             && frame->format != AV_SAMPLE_FMT_DBL && frame->format != AV_SAMPLE_FMT_S16P && frame->format != AV_SAMPLE_FMT_S16
             && frame->format != AV_SAMPLE_FMT_S32P && frame->format != AV_SAMPLE_FMT_S32
@@ -456,7 +459,7 @@ static NTSTATUS write_audio_frame( const AVFrame *frame, const struct winedmo_fr
                 value = value * 32768.0f;
                 if (value > 32767.0f) value = 32767.0f;
                 if (value < -32768.0f) value = -32768.0f;
-                ((INT16 *)dst)[i * channels + c] = (INT16)lrintf( value );
+                ((INT16 *)dst)[i * channels + c] = (INT16)(value >= 0.0f ? value + 0.5f : value - 0.5f);
             }
         }
     }

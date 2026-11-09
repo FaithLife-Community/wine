@@ -1,6 +1,7 @@
 MODULE    = msauddecmft.dll
-IMPORTS   = combase mfplat mfuuid dmoguids strmiids wmcodecdspuuid uuid
+IMPORTS   = winedmo advapi32 combase mfplat mfuuid dmoguids strmiids wmcodecdspuuid uuid
 
 SOURCES = \
+	aac_decoder.c \
 	msauddecmft.c \
 	msauddecmft.idl
