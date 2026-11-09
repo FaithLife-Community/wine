@@ -995,10 +995,11 @@ static HRESULT WINAPI WMPSettings_put_rate(IWMPSettings *iface, double v)
     if (v <= 0.0)
         return E_INVALIDARG;
     This->rate = v;
-    /* FIXME: quartz's audio renderer can't play faster or slower without changing the pitch;
-     * passing the rate on left it silent. Store it and keep playing at normal speed. */
-    if (v != 1.0)
-        FIXME("Ignoring rate %f.\n", v);
+    if (!This->mf_player || !This->item_set)
+        return S_OK;
+
+    if (FAILED(IMFPMediaPlayer_SetRate(This->mf_player, v)))
+        WARN("Failed to set rate %f.\n", v);
     return S_OK;
 }
 
@@ -1817,6 +1818,8 @@ static void media_item_ready(WindowsMediaPlayer *This)
 {
     This->item_set = TRUE;
     IWMPSettings_put_volume(&This->IWMPSettings_iface, This->volume);
+    if (This->rate != 1.0)
+        IWMPSettings_put_rate(&This->IWMPSettings_iface, This->rate);
     update_state(This, DISPID_WMPCOREEVENT_OPENSTATECHANGE, wmposMediaOpen);
     apply_pending_position(This);
 }
