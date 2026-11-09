@@ -131,3 +131,13 @@ extern IMFAttributes *topology_node_transform_async_get_attributes(IMFTopologyNo
 extern HRESULT stream_sink_get_device_manager(IMFStreamSink *stream_sink, IUnknown **device_manager);
 
 extern HRESULT enum_audio_capture_sources(IMFAttributes *attributes, IMFActivate ***sources, UINT32 *ret_count);
+
+struct tempo;
+extern struct tempo *tempo_create(unsigned int channels, unsigned int sample_rate);
+extern void tempo_destroy(struct tempo *tempo);
+extern void tempo_reset(struct tempo *tempo);
+extern void tempo_set_rate(struct tempo *tempo, float rate);
+extern BOOL tempo_is_empty(const struct tempo *tempo);
+extern HRESULT tempo_push(struct tempo *tempo, const float *data, unsigned int frames, LONGLONG time);
+extern unsigned int tempo_output(struct tempo *tempo, float *out, unsigned int max_frames, LONGLONG *time);
+extern unsigned int tempo_max_output(const struct tempo *tempo, unsigned int input_frames);
