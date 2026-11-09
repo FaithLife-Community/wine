@@ -1819,6 +1819,20 @@ static void window_request_desired_state( struct x11drv_win_data *data )
 /***********************************************************************
  *      GetWindowStateUpdates   (X11DRV.@)
  */
+static BOOL is_unmanaged_no_activate( HWND hwnd )
+{
+    struct x11drv_win_data *data;
+    BOOL ret = FALSE;
+
+    if (!(NtUserGetWindowLongW( hwnd, GWL_EXSTYLE ) & WS_EX_NOACTIVATE)) return FALSE;
+    if ((data = get_win_data( hwnd )))
+    {
+        ret = !data->managed && !data->embedder;
+        release_win_data( data );
+    }
+    return ret;
+}
+
 BOOL X11DRV_GetWindowStateUpdates( HWND hwnd, UINT *state_cmd, UINT *swp_flags, RECT *rect, HWND *foreground )
 {
     struct x11drv_thread_data *thread_data = x11drv_thread_data();
@@ -1846,6 +1860,16 @@ BOOL X11DRV_GetWindowStateUpdates( HWND hwnd, UINT *state_cmd, UINT *swp_flags, 
     {
         *foreground = hwnd_from_window( thread_data->display, thread_data->current_state.net_active_window );
         if (*foreground == old_foreground) *foreground = 0;
+        /* A no-activate popup made active with SetActiveWindow never gets the X focus
+         * (see X11DRV_ActivateWindow), so the WM still reports the window behind it as
+         * active. Don't take the activation back from it for that, WPF closes its popups
+         * as soon as they are deactivated. */
+        if (*foreground && is_unmanaged_no_activate( old_foreground ) &&
+            NtUserGetWindowThread( *foreground, NULL ) == GetCurrentThreadId())
+        {
+            TRACE( "keeping no-activate popup %p active, X active window is %p\n", old_foreground, *foreground );
+            *foreground = 0;
+        }
     }
 
     if ((data = get_win_data( hwnd )))
