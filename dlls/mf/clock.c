@@ -434,6 +434,9 @@ static HRESULT WINAPI present_clock_GetTime(IMFPresentationClock *iface, MFTIME 
         hr = IMFPresentationTimeSource_GetCorrelatedTime(clock->time_source, 0, time, &systime);
     LeaveCriticalSection(&clock->cs);
 
+    if (SUCCEEDED(hr))
+        TRACE("Presentation time %s, system time %s.\n", debugstr_time(*time), debugstr_time(systime));
+
     return hr;
 }
 
