@@ -333,3 +333,99 @@ NTSTATUS CDECL winedmo_demuxer_stream_type( struct winedmo_demuxer demuxer, UINT
     TRACE( "demuxer %#I64x, stream %u, major %p, format %p\n", demuxer.handle, stream, major, format );
     return get_media_type( unix_demuxer_stream_type, &params, &params.media_type, major, format );
 }
+
+
+static UINT format_size( const GUID *major, const union winedmo_format *format )
+{
+    if (IsEqualGUID( major, &MFMediaType_Video )) return format->video.dwSize;
+    if (IsEqualGUID( major, &MFMediaType_Audio )) return sizeof(format->audio) + format->audio.cbSize;
+    return 0;
+}
+
+NTSTATUS CDECL winedmo_decoder_create( const GUID *major, const union winedmo_format *format, struct winedmo_decoder *decoder )
+{
+    struct decoder_create_params params = {.major = *major, .format = (UINT_PTR)format};
+    NTSTATUS status;
+
+    TRACE( "major %s, format %p, decoder %p\n", debugstr_guid(major), format, decoder );
+
+    params.format_size = format_size( major, format );
+    if ((status = UNIX_CALL( decoder_create, &params )))
+    {
+        WARN( "Failed to create decoder, status %#lx\n", status );
+        return status;
+    }
+
+    *decoder = params.decoder;
+    TRACE( "created decoder %#I64x\n", decoder->handle );
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS CDECL winedmo_decoder_destroy( struct winedmo_decoder *decoder )
+{
+    struct decoder_destroy_params params = {.decoder = *decoder};
+    NTSTATUS status;
+
+    if (!decoder->handle) return STATUS_SUCCESS;
+
+    TRACE( "decoder %#I64x\n", decoder->handle );
+
+    decoder->handle = 0;
+    if ((status = UNIX_CALL( decoder_destroy, &params ))) WARN( "decoder_destroy failed, status %#lx\n", status );
+    return status;
+}
+
+NTSTATUS CDECL winedmo_decoder_process_input( struct winedmo_decoder decoder, const BYTE *data, UINT size,
+                                              INT64 pts, INT64 duration )
+{
+    struct decoder_process_input_params params = {.decoder = decoder};
+
+    TRACE( "decoder %#I64x, data %p, size %#x, pts %I64d, duration %I64d\n", decoder.handle, data, size, pts, duration );
+
+    if (!data) return STATUS_INVALID_PARAMETER;
+    params.sample.data = (UINT_PTR)data;
+    params.sample.size = size;
+    params.sample.pts = pts;
+    params.sample.dts = INT64_MIN;
+    params.sample.duration = duration;
+    return UNIX_CALL( decoder_process_input, &params );
+}
+
+NTSTATUS CDECL winedmo_decoder_drain( struct winedmo_decoder decoder )
+{
+    struct decoder_process_input_params params = {.decoder = decoder};
+
+    TRACE( "decoder %#I64x\n", decoder.handle );
+
+    return UNIX_CALL( decoder_process_input, &params );
+}
+
+NTSTATUS CDECL winedmo_decoder_process_output( struct winedmo_decoder decoder, struct winedmo_frame_format *format,
+                                               BYTE *data, UINT *size, INT64 *pts, INT64 *duration )
+{
+    struct decoder_process_output_params params = {.decoder = decoder, .format = *format};
+    NTSTATUS status;
+
+    TRACE( "decoder %#I64x, format %p, data %p, size %#x\n", decoder.handle, format, data, *size );
+
+    params.sample.data = (UINT_PTR)data;
+    params.sample.size = *size;
+    status = UNIX_CALL( decoder_process_output, &params );
+    *format = params.format;
+    *size = params.sample.size;
+    if (!status)
+    {
+        *pts = params.sample.pts;
+        *duration = params.sample.duration;
+    }
+    return status;
+}
+
+NTSTATUS CDECL winedmo_decoder_flush( struct winedmo_decoder decoder )
+{
+    struct decoder_flush_params params = {.decoder = decoder};
+
+    TRACE( "decoder %#I64x\n", decoder.handle );
+
+    return UNIX_CALL( decoder_flush, &params );
+}
