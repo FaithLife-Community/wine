@@ -56,6 +56,7 @@ struct queued_object
         {
             IMFSample *sample;
             unsigned int frame_offset;
+            float rate;
         } sample;
         struct
         {
@@ -112,6 +113,19 @@ struct audio_renderer
     UINT64 position;
     UINT64 audio_clock_frequency;
     float rate;
+    /* Playback rate of the audio that pts and position describe. */
+    float pts_rate;
+    /* Start of audio written at another rate, which takes over once it plays. */
+    struct
+    {
+        BOOL valid;
+        LONGLONG pts;
+        UINT64 position;
+        float rate;
+    } pending;
+    unsigned int channels;
+    BOOL is_float;
+    struct tempo *tempo;
 };
 
 static void release_pending_object(struct queued_object *object)
@@ -260,6 +274,10 @@ static void audio_renderer_release_audio_client(struct audio_renderer *renderer)
     }
     renderer->position = 0;
     renderer->pts = 0;
+    renderer->pts_rate = renderer->rate ? renderer->rate : 1.0f;
+    renderer->pending.valid = FALSE;
+    tempo_destroy(renderer->tempo);
+    renderer->tempo = NULL;
     renderer->audio_client = NULL;
     if (renderer->audio_render_client)
         IAudioRenderClient_Release(renderer->audio_render_client);
@@ -406,6 +424,19 @@ static HRESULT WINAPI audio_renderer_sink_GetStreamSinkById(IMFMediaSink *iface,
     return hr;
 }
 
+#define SAR_MIN_RATE 0.25f
+#define SAR_MAX_RATE 4.0f
+
+/* Rates other than 0 and 1 are played by time stretching, which needs float samples. */
+static BOOL audio_renderer_rate_supported(struct audio_renderer *renderer, float rate)
+{
+    if (rate == 0.0f || rate == 1.0f)
+        return TRUE;
+    if (rate < SAR_MIN_RATE || rate > SAR_MAX_RATE)
+        return FALSE;
+    return !renderer->audio_client || renderer->is_float;
+}
+
 static void audio_renderer_set_presentation_clock(struct audio_renderer *renderer, IMFPresentationClock *clock)
 {
     if (renderer->clock)
@@ -425,9 +456,20 @@ static HRESULT WINAPI audio_renderer_sink_SetPresentationClock(IMFMediaSink *ifa
 {
     struct audio_renderer *renderer = impl_from_IMFMediaSink(iface);
     IMFPresentationTimeSource *time_source = NULL;
+    IMFRateControl *rate_control;
+    float rate = 1.0f;
     HRESULT hr = S_OK;
 
     TRACE("%p, %p.\n", iface, clock);
+
+    /* A clock reused from an earlier presentation may already run at another rate.
+     * Ask outside our lock, the clock calls into us with its own lock held. */
+    if (clock && SUCCEEDED(IMFPresentationClock_QueryInterface(clock, &IID_IMFRateControl, (void **)&rate_control)))
+    {
+        if (FAILED(IMFRateControl_GetRate(rate_control, NULL, &rate)))
+            rate = 1.0f;
+        IMFRateControl_Release(rate_control);
+    }
 
     EnterCriticalSection(&renderer->cs);
 
@@ -438,6 +480,11 @@ static HRESULT WINAPI audio_renderer_sink_SetPresentationClock(IMFMediaSink *ifa
         if (time_source)
             IMFPresentationTimeSource_Release(time_source);
         audio_renderer_set_presentation_clock(renderer, clock);
+        if (clock && rate != renderer->rate && audio_renderer_rate_supported(renderer, rate))
+        {
+            TRACE("Clock runs at rate %f.\n", rate);
+            renderer->rate = rate;
+        }
     }
 
     LeaveCriticalSection(&renderer->cs);
@@ -793,7 +840,7 @@ static HRESULT WINAPI audio_renderer_clock_sink_OnClockSetRate(IMFClockStateSink
 
     EnterCriticalSection(&renderer->cs);
 
-    if (rate == 0.0 || rate == 1.0)
+    if (audio_renderer_rate_supported(renderer, rate))
     {
         renderer->rate = rate;
     }
@@ -1242,7 +1289,18 @@ static HRESULT audio_renderer_get_correlated_time(struct audio_renderer *rendere
     if (FAILED(hr = IAudioClock_GetPosition(renderer->audio_clock, &position, &counter)))
         return hr;
 
-    time = renderer->pts + (INT64)(position - renderer->position) * MFCLOCK_FREQUENCY_HNS / (INT64)renderer->audio_clock_frequency;
+    if (renderer->pending.valid && position >= renderer->pending.position)
+    {
+        renderer->pts = renderer->pending.pts;
+        renderer->position = renderer->pending.position;
+        renderer->pts_rate = renderer->pending.rate;
+        renderer->pending.valid = FALSE;
+    }
+
+    time = (INT64)(position - renderer->position) * MFCLOCK_FREQUENCY_HNS / (INT64)renderer->audio_clock_frequency;
+    if (renderer->pts_rate != 1.0f)
+        time = time * renderer->pts_rate;
+    time += renderer->pts;
     if (renderer->flags & SAR_REPORT_SEEK_TIME)
     {
         if (time < renderer->seek_pts)
@@ -1526,6 +1584,78 @@ static HRESULT WINAPI audio_renderer_stream_GetMediaTypeHandler(IMFStreamSink *i
     return S_OK;
 }
 
+/* Time stretches a sample for the current rate and queues what the stretcher
+ * can output so far, timestamped with the media time it starts at. */
+static HRESULT stream_queue_stretched_sample(struct audio_renderer *renderer, IMFSample *sample,
+        LONGLONG start_time, DWORD sample_frames)
+{
+    struct queued_object *object;
+    IMFMediaBuffer *buffer, *out_buffer;
+    unsigned int max_frames, frames;
+    IMFSample *out_sample;
+    LONGLONG out_time;
+    DWORD len, max_len;
+    BYTE *src, *dst;
+    HRESULT hr;
+
+    tempo_set_rate(renderer->tempo, renderer->rate);
+
+    if (FAILED(hr = IMFSample_ConvertToContiguousBuffer(sample, &buffer)))
+        return hr;
+    if (SUCCEEDED(hr = IMFMediaBuffer_Lock(buffer, &src, &max_len, &len)))
+    {
+        hr = tempo_push(renderer->tempo, (const float *)src, len / renderer->frame_size, start_time);
+        IMFMediaBuffer_Unlock(buffer);
+    }
+    IMFMediaBuffer_Release(buffer);
+    if (FAILED(hr))
+        return hr;
+
+    max_frames = tempo_max_output(renderer->tempo, 0);
+    if (FAILED(hr = MFCreateMemoryBuffer(max_frames * renderer->frame_size, &out_buffer)))
+        return hr;
+    if (FAILED(hr = IMFMediaBuffer_Lock(out_buffer, &dst, NULL, NULL)))
+    {
+        IMFMediaBuffer_Release(out_buffer);
+        return hr;
+    }
+    frames = tempo_output(renderer->tempo, (float *)dst, max_frames, &out_time);
+    IMFMediaBuffer_Unlock(out_buffer);
+
+    if (!frames)
+    {
+        IMFMediaBuffer_Release(out_buffer);
+        return S_OK;
+    }
+
+    IMFMediaBuffer_SetCurrentLength(out_buffer, frames * renderer->frame_size);
+    hr = MFCreateSample(&out_sample);
+    if (SUCCEEDED(hr))
+        hr = IMFSample_AddBuffer(out_sample, out_buffer);
+    IMFMediaBuffer_Release(out_buffer);
+    if (FAILED(hr))
+    {
+        if (out_sample) IMFSample_Release(out_sample);
+        return hr;
+    }
+    IMFSample_SetSampleTime(out_sample, out_time);
+
+    if (!(object = calloc(1, sizeof(*object))))
+    {
+        IMFSample_Release(out_sample);
+        return E_OUTOFMEMORY;
+    }
+
+    object->type = OBJECT_TYPE_SAMPLE;
+    object->u.sample.sample = out_sample;
+    object->u.sample.rate = renderer->rate;
+
+    list_add_tail(&renderer->queue, &object->entry);
+    renderer->queued_frames += frames;
+
+    return S_OK;
+}
+
 static HRESULT stream_queue_sample(struct audio_renderer *renderer, IMFSample *sample)
 {
     DWORD sample_len, sample_frames, buffer_count;
@@ -1554,11 +1684,17 @@ static HRESULT stream_queue_sample(struct audio_renderer *renderer, IMFSample *s
 
     renderer->flags &= ~SAR_SEEKING;
 
+    if (renderer->tempo && renderer->rate != 1.0f && renderer->rate != 0.0f)
+        return stream_queue_stretched_sample(renderer, sample, start_time, sample_frames);
+    if (renderer->tempo && !tempo_is_empty(renderer->tempo))
+        tempo_reset(renderer->tempo);
+
     if (!(object = calloc(1, sizeof(*object))))
         return E_OUTOFMEMORY;
 
     object->type = OBJECT_TYPE_SAMPLE;
     object->u.sample.sample = sample;
+    object->u.sample.rate = 1.0f;
     IMFSample_AddRef(object->u.sample.sample);
 
     list_add_tail(&renderer->queue, &object->entry);
@@ -1665,6 +1801,8 @@ static HRESULT WINAPI audio_renderer_stream_Flush(IMFStreamSink *iface)
             release_pending_object(obj);
         }
         renderer->queued_frames = 0;
+        if (renderer->tempo)
+            tempo_reset(renderer->tempo);
         if (renderer->audio_client)
         {
             BOOL running = renderer->clock_state == MFCLOCK_STATE_RUNNING && renderer->rate != 0.0f;
@@ -1678,6 +1816,8 @@ static HRESULT WINAPI audio_renderer_stream_Flush(IMFStreamSink *iface)
             {
                 renderer->position = 0;
                 renderer->pts = 0;
+                renderer->pts_rate = renderer->rate ? renderer->rate : 1.0f;
+                renderer->pending.valid = FALSE;
             }
             else
                 WARN("Failed to reset audio client, hr %#lx.\n", hr);
@@ -1829,6 +1969,12 @@ static HRESULT audio_renderer_create_audio_client(struct audio_renderer *rendere
 
     renderer->frame_size = wfx->wBitsPerSample * wfx->nChannels / 8;
     renderer->sample_rate = wfx->nSamplesPerSec;
+    renderer->channels = wfx->nChannels;
+    renderer->is_float = wfx->wBitsPerSample == 32 && (wfx->wFormatTag == WAVE_FORMAT_IEEE_FLOAT
+            || (wfx->wFormatTag == WAVE_FORMAT_EXTENSIBLE && IsEqualGUID(&((WAVEFORMATEXTENSIBLE *)wfx)->SubFormat,
+            &MFAudioFormat_Float)));
+    if (renderer->is_float)
+        renderer->tempo = tempo_create(renderer->channels, renderer->sample_rate);
 
     flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
     if (renderer->stream_config.flags & MF_AUDIO_RENDERER_ATTRIBUTE_FLAGS_CROSSPROCESS)
@@ -2076,6 +2222,27 @@ static void audio_renderer_render_silence(struct audio_renderer *renderer)
     }
 }
 
+/* Records that the frame written at "position" has presentation time "pts". Audio
+ * written at a new rate only takes over the clock once it starts playing, the
+ * frames still queued before it play at the old one. */
+static void audio_renderer_set_time_anchor(struct audio_renderer *renderer, LONGLONG pts, UINT64 position, float rate)
+{
+    if (rate == renderer->pts_rate && !renderer->pending.valid)
+    {
+        renderer->pts = pts;
+        renderer->position = position;
+        return;
+    }
+
+    if (renderer->pending.valid && rate == renderer->pending.rate)
+        return;
+
+    renderer->pending.valid = TRUE;
+    renderer->pending.pts = pts;
+    renderer->pending.position = position;
+    renderer->pending.rate = rate;
+}
+
 static void audio_renderer_render(struct audio_renderer *renderer, IMFAsyncResult *result)
 {
     unsigned int src_frames, dst_frames, max_frames, pad_frames;
@@ -2134,8 +2301,8 @@ static void audio_renderer_render(struct audio_renderer *renderer, IMFAsyncResul
                                             TRACE("First sample after start: pts %s, start %s, written at %I64u, played %I64u.\n",
                                                     debugstr_time(pts), debugstr_time(renderer->seek_pts), position,
                                                     position - pad_frames * renderer->audio_clock_frequency / renderer->sample_rate);
-                                        renderer->pts = pts;
-                                        renderer->position = position;
+                                        audio_renderer_set_time_anchor(renderer, pts, position,
+                                                obj->u.sample.rate);
                                     }
 
                                     obj->u.sample.frame_offset += dst_frames;
@@ -2219,6 +2386,7 @@ static HRESULT sar_create_object(IMFAttributes *attributes, void *user_context, 
     renderer->IMFPresentationTimeSource_iface.lpVtbl = &audio_renderer_time_source_vtbl;
     renderer->render_callback.lpVtbl = &audio_renderer_render_callback_vtbl;
     renderer->rate = 1.0f;
+    renderer->pts_rate = 1.0f;
     renderer->refcount = 1;
     InitializeCriticalSection(&renderer->cs);
     renderer->buffer_ready_event = CreateEventW(NULL, FALSE, FALSE, NULL);
