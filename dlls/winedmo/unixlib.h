@@ -151,6 +151,37 @@ struct demuxer_stream_type_params
     struct media_type media_type;
 };
 
+struct decoder_create_params
+{
+    GUID major;
+    UINT32 format_size;
+    UINT64 format; /* pointer to user memory */
+    struct winedmo_decoder decoder;
+};
+
+struct decoder_destroy_params
+{
+    struct winedmo_decoder decoder;
+};
+
+struct decoder_process_input_params
+{
+    struct winedmo_decoder decoder;
+    struct sample sample; /* no data starts draining */
+};
+
+struct decoder_process_output_params
+{
+    struct winedmo_decoder decoder;
+    struct winedmo_frame_format format;
+    struct sample sample;
+};
+
+struct decoder_flush_params
+{
+    struct winedmo_decoder decoder;
+};
+
 
 enum unix_funcs
 {
@@ -164,6 +195,12 @@ enum unix_funcs
     unix_demuxer_stream_lang,
     unix_demuxer_stream_name,
     unix_demuxer_stream_type,
+
+    unix_decoder_create,
+    unix_decoder_destroy,
+    unix_decoder_process_input,
+    unix_decoder_process_output,
+    unix_decoder_flush,
 
     unix_funcs_count,
 };
