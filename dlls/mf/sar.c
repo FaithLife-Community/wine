@@ -1667,6 +1667,13 @@ static HRESULT WINAPI audio_renderer_stream_Flush(IMFStreamSink *iface)
         renderer->queued_frames = 0;
         if (renderer->audio_client)
         {
+            BOOL running = renderer->clock_state == MFCLOCK_STATE_RUNNING && renderer->rate != 0.0f;
+
+            /* The session flushes without stopping the clock when seeking during playback.
+             * IAudioClient::Reset() fails on a running client, which left the old audio
+             * playing and the position counting on from before the seek. */
+            if (running && FAILED(hr = IAudioClient_Stop(renderer->audio_client)))
+                WARN("Failed to stop audio client, hr %#lx.\n", hr);
             if (SUCCEEDED(hr = IAudioClient_Reset(renderer->audio_client)))
             {
                 renderer->position = 0;
@@ -1674,6 +1681,8 @@ static HRESULT WINAPI audio_renderer_stream_Flush(IMFStreamSink *iface)
             }
             else
                 WARN("Failed to reset audio client, hr %#lx.\n", hr);
+            if (running && FAILED(IAudioClient_Start(renderer->audio_client)))
+                WARN("Failed to restart audio client.\n");
         }
     }
     LeaveCriticalSection(&renderer->cs);
@@ -2121,6 +2130,10 @@ static void audio_renderer_render(struct audio_renderer *renderer, IMFAsyncResul
 
                                     if (obj->u.sample.frame_offset == 0)
                                     {
+                                        if (renderer->flags & SAR_REPORT_SEEK_TIME)
+                                            TRACE("First sample after start: pts %s, start %s, written at %I64u, played %I64u.\n",
+                                                    debugstr_time(pts), debugstr_time(renderer->seek_pts), position,
+                                                    position - pad_frames * renderer->audio_clock_frequency / renderer->sample_rate);
                                         renderer->pts = pts;
                                         renderer->position = position;
                                     }

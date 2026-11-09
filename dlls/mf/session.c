@@ -3859,7 +3859,7 @@ static HRESULT transform_node_pull_samples(const struct media_session *session, 
 
     status = 0;
 
-    do
+    for (;;)
     {
         hr = IMFTransform_ProcessOutput(node->object.transform, 0, node->u.transform.output_count, buffers, &status);
         if (hr == MF_E_TRANSFORM_STREAM_CHANGE && SUCCEEDED(hr = transform_node_format_changed(node, buffers)))
@@ -3872,8 +3872,19 @@ static HRESULT transform_node_pull_samples(const struct media_session *session, 
 
             hr = IMFTransform_ProcessOutput(node->object.transform, 0, node->u.transform.output_count, buffers, &status);
         }
+
+        if (hr != S_OK || !transform_node_markin_need_more_input(session, node, buffers))
+            break;
+
+        /* Every output sample was dropped as being before the start position, and
+         * the dropped samples were released. Pull again into fresh samples rather
+         * than handing the transform the emptied buffers. */
+        release_output_samples(node, buffers);
+
+        memset(buffers, 0, node->u.transform.output_count * sizeof(*buffers));
+        if (FAILED(hr = allocate_output_samples(session, node, buffers)))
+            goto done;
     }
-    while (hr == S_OK && transform_node_markin_need_more_input(session, node, buffers));
 
     /* Collect returned samples for all streams. */
     for (i = 0; i < node->u.transform.output_count; ++i)

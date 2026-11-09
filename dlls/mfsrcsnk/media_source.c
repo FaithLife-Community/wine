@@ -1738,10 +1738,64 @@ static NTSTATUS CDECL media_source_seek_cb( struct winedmo_stream *stream, UINT6
 static NTSTATUS CDECL media_source_read_cb(struct winedmo_stream *stream, BYTE *buffer, ULONG *size)
 {
     struct media_source *source = CONTAINING_RECORD(stream, struct media_source, winedmo_stream);
+    ULONG total = 0, read, waited = 0, calls = 0;
+    HRESULT hr = S_OK;
+    QWORD pos;
+
     TRACE("stream %p, buffer %p, size %p\n", stream, buffer, size);
 
-    if (FAILED(IMFByteStream_Read(source->stream, buffer, *size, size)))
+    /* winedmo caches the stream in fixed-size blocks and takes a short block for the end of the
+     * stream. IMFByteStream::Read() may return fewer bytes than asked for anywhere, e.g. for a
+     * stream that is still downloading, so keep reading until the block is full or the stream
+     * really ends. Short reads used to end playback a few seconds after seeking. */
+    while (total < *size)
+    {
+        ++calls;
+        if (FAILED(hr = IMFByteStream_Read(source->stream, buffer + total, *size - total, &read)))
+        {
+            if (!waited)
+                WARN("Read of %lu bytes failed, hr %#lx.\n", *size - total, hr);
+            read = 0;
+        }
+        if (read)
+        {
+            total += read;
+            continue;
+        }
+
+        if (source->file_size == -1 || FAILED(IMFByteStream_GetCurrentPosition(source->stream, &pos)))
+            break;
+        if (pos >= source->file_size)
+        {
+            QWORD length;
+
+            /* The length of a stream that is still downloading may grow. */
+            if (FAILED(IMFByteStream_GetLength(source->stream, &length)) || length <= source->file_size)
+            {
+                TRACE("End of stream at %#I64x.\n", pos);
+                break;
+            }
+            WARN("Stream length grew from %#I64x to %#I64x.\n", source->file_size, length);
+            source->file_size = length;
+            continue;
+        }
+        if (waited >= 30000)
+        {
+            WARN("No data at %#I64x of %#I64x after %lu ms, giving up.\n", pos, source->file_size, waited);
+            break;
+        }
+        if (!waited)
+            TRACE("No data yet at %#I64x of %#I64x, waiting.\n", pos, source->file_size);
+        Sleep(20);
+        waited += 20;
+    }
+
+    if (calls > 1)
+        TRACE("Read %#lx of %#lx bytes in %lu calls, waited %lu ms.\n", total, *size, calls, waited);
+    if (!total && FAILED(hr))
         return STATUS_UNSUCCESSFUL;
+
+    *size = total;
     return STATUS_SUCCESS;
 }
 
@@ -1758,6 +1812,12 @@ static HRESULT media_source_async_create(struct media_source *source, IMFAsyncRe
     {
         WARN("Failed to get byte stream length, hr %#lx\n", hr);
         source->file_size = -1;
+    }
+    else
+    {
+        DWORD caps = 0;
+        IMFByteStream_GetCapabilities(source->stream, &caps);
+        TRACE("Byte stream length %#I64x, capabilities %#lx.\n", source->file_size, caps);
     }
     if (FAILED(hr = IMFByteStream_SetCurrentPosition(source->stream, 0)))
     {
