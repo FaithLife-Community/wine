@@ -2130,6 +2130,10 @@ static void audio_renderer_render(struct audio_renderer *renderer, IMFAsyncResul
 
                                     if (obj->u.sample.frame_offset == 0)
                                     {
+                                        if (renderer->flags & SAR_REPORT_SEEK_TIME)
+                                            TRACE("First sample after start: pts %s, start %s, written at %I64u, played %I64u.\n",
+                                                    debugstr_time(pts), debugstr_time(renderer->seek_pts), position,
+                                                    position - pad_frames * renderer->audio_clock_frequency / renderer->sample_rate);
                                         renderer->pts = pts;
                                         renderer->position = position;
                                     }
