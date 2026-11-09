@@ -26,6 +26,7 @@
 #include "mfapi.h"
 #include "mfidl.h"
 #include "rpcproxy.h"
+#include "winreg.h"
 
 #include "wine/debug.h"
 
@@ -35,11 +36,40 @@ WINE_DEFAULT_DEBUG_CHANNEL(dmo);
 
 DEFINE_MEDIATYPE_GUID(MFAudioFormat_RAW_AAC,WAVE_FORMAT_RAW_AAC1);
 
+extern HRESULT ffmpeg_aac_decoder_create(REFIID riid, void **out);
+
+/* FFmpeg decoders are used when Wine's FFmpeg media source is enabled, or
+ * when they are asked for explicitly; GStreamer stays the fallback. */
+static BOOL use_ffmpeg_decoders(void)
+{
+    DWORD value, size = sizeof(value);
+
+    if (!RegGetValueW(HKEY_CURRENT_USER, L"Software\\Wine\\MediaFoundation", L"DisableGstDecoders",
+            RRF_RT_REG_DWORD, NULL, &value, &size))
+        return !!value;
+    size = sizeof(value);
+    if (!RegGetValueW(HKEY_CURRENT_USER, L"Software\\Wine\\MediaFoundation", L"DisableGstByteStreamHandler",
+            RRF_RT_REG_DWORD, NULL, &value, &size))
+        return !!value;
+    return FALSE;
+}
+
 static HRESULT WINAPI aac_decoder_factory_CreateInstance(IClassFactory *iface, IUnknown *outer,
         REFIID riid, void **out)
 {
     static const GUID CLSID_wg_aac_decoder = {0xe7889a8a,0x2083,0x4844,{0x83,0x70,0x5e,0xe3,0x49,0xb1,0x45,0x03}};
-    return CoCreateInstance(&CLSID_wg_aac_decoder, outer, CLSCTX_INPROC_SERVER, riid, out);
+    BOOL ffmpeg = use_ffmpeg_decoders();
+    HRESULT hr;
+
+    TRACE("outer %p, riid %s, out %p, ffmpeg %u.\n", outer, debugstr_guid(riid), out, ffmpeg);
+
+    if (ffmpeg && !outer && SUCCEEDED(hr = ffmpeg_aac_decoder_create(riid, out)))
+        return hr;
+    if (SUCCEEDED(hr = CoCreateInstance(&CLSID_wg_aac_decoder, outer, CLSCTX_INPROC_SERVER, riid, out))
+            || ffmpeg || outer)
+        return hr;
+    /* GStreamer or its AAC plugin is missing, try FFmpeg */
+    return ffmpeg_aac_decoder_create(riid, out);
 }
 
 static HRESULT WINAPI class_factory_QueryInterface(IClassFactory *iface, REFIID riid, void **out)
