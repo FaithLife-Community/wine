@@ -21,6 +21,8 @@
 #endif
 
 #include "config.h"
+
+#include <unistd.h>
 #include "unix_private.h"
 
 #include "mfapi.h"
@@ -179,10 +181,19 @@ NTSTATUS decoder_create( void *arg )
         goto failed;
 
     ctx->pkt_timebase = (AVRational){1, 10000000};
-    /* Frame threading holds back one frame per thread before the first output,
-     * Media Foundation decoders return frames as soon as they can. */
+    /* Most H.264 streams have one slice per frame, so slice threading alone
+     * decodes on one core, too slow for HD video. Frame threading holds back
+     * one frame per thread before the first output, and the media session
+     * feeds a decoder that returns no output ever more slowly, so keep the
+     * frame threads few. */
     ctx->thread_count = 0;
     ctx->thread_type = FF_THREAD_SLICE;
+    if (IsEqualGUID( &params->major, &MFMediaType_Video ))
+    {
+        long cpus = sysconf( _SC_NPROCESSORS_ONLN );
+        ctx->thread_count = cpus > 4 ? 4 : cpus > 1 ? cpus : 1;
+        ctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+    }
 
     if (IsEqualGUID( &params->major, &MFMediaType_Video ))
     {
