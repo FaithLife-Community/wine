@@ -686,6 +686,15 @@ static HRESULT media_source_send_eos(struct media_source *source, struct media_s
     return S_OK;
 }
 
+static UINT media_source_token_count(struct media_source *source)
+{
+    UINT i, count = 0;
+
+    for (i = 0; i < source->stream_count; i++)
+        count += list_count(&source->streams[i]->tokens);
+    return count;
+}
+
 static HRESULT media_source_read(struct media_source *source)
 {
     IMFSample *sample;
@@ -708,7 +717,10 @@ static HRESULT media_source_read(struct media_source *source)
         return S_OK;
     }
 
-    if ((hr = media_source_send_sample(source, index, sample)) == S_FALSE)
+    /* Keep reading while a stream still waits for a sample, but don't read
+     * the whole file ahead into the queues of streams nobody asked yet. */
+    if ((hr = media_source_send_sample(source, index, sample)) == S_FALSE
+            && source->pending_reads < media_source_token_count(source))
         queue_media_source_read(source);
     IMFSample_Release(sample);
 
