@@ -698,6 +698,7 @@ static HRESULT WINAPI transform_ProcessOutput(IMFTransform *iface, DWORD flags, 
         decoder->next_time = time + duration;
         IMFSample_SetSampleTime(samples->pSample, time);
         IMFSample_SetSampleDuration(samples->pSample, duration);
+        TRACE("Frame at %s, duration %s.\n", wine_dbgstr_longlong(time), wine_dbgstr_longlong(duration));
         IMFSample_SetUINT32(samples->pSample, &MFSampleExtension_CleanPoint, 1);
         hr = S_OK;
         break;
