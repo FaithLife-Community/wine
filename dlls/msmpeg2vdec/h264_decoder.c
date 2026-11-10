@@ -571,9 +571,11 @@ static HRESULT WINAPI transform_ProcessOutput(IMFTransform *iface, DWORD flags, 
 {
     struct h264_decoder *decoder = impl_from_IMFTransform(iface);
     struct winedmo_frame_format format = {0};
+    IMF2DBuffer *buffer_2d = NULL;
     LONGLONG time, duration;
     IMFMediaBuffer *buffer;
     UINT64 frame_rate;
+    DWORD buffer_count;
     UINT32 stride;
     NTSTATUS ret;
     DWORD size;
@@ -603,9 +605,40 @@ static HRESULT WINAPI transform_ProcessOutput(IMFTransform *iface, DWORD flags, 
     }
     format.stride = abs((INT32)stride);
 
-    if (FAILED(hr = IMFSample_ConvertToContiguousBuffer(samples->pSample, &buffer)))
+    /* With the EVR downstream, the session hands us its Direct3D surface samples,
+     * which only support 2D locking with their own pitch. */
+    if (FAILED(hr = IMFSample_GetBufferCount(samples->pSample, &buffer_count)) || buffer_count != 1)
+        hr = IMFSample_ConvertToContiguousBuffer(samples->pSample, &buffer);
+    else
+        hr = IMFSample_GetBufferByIndex(samples->pSample, 0, &buffer);
+    if (FAILED(hr))
         return hr;
-    if (FAILED(hr = IMFMediaBuffer_Lock(buffer, &data, &size, NULL)))
+
+    if (SUCCEEDED(IMFMediaBuffer_QueryInterface(buffer, &IID_IMF2DBuffer, (void **)&buffer_2d)))
+    {
+        LONG pitch;
+
+        if (FAILED(hr = IMF2DBuffer_Lock2D(buffer_2d, &data, &pitch)))
+        {
+            IMF2DBuffer_Release(buffer_2d);
+            IMFMediaBuffer_Release(buffer);
+            return hr;
+        }
+        if (pitch < 0)
+        {
+            FIXME("Bottom-up output buffers are not supported.\n");
+            IMF2DBuffer_Unlock2D(buffer_2d);
+            IMF2DBuffer_Release(buffer_2d);
+            IMFMediaBuffer_Release(buffer);
+            return E_NOTIMPL;
+        }
+        format.stride = pitch;
+        /* rows of pitch bytes: luma, then chroma for 4:2:0 formats */
+        size = pitch * format.height;
+        if (!IsEqualGUID(&format.subtype, &MFVideoFormat_YUY2))
+            size += pitch * ((format.height + 1) / 2);
+    }
+    else if (FAILED(hr = IMFMediaBuffer_Lock(buffer, &data, &size, NULL)))
     {
         IMFMediaBuffer_Release(buffer);
         return hr;
@@ -613,7 +646,13 @@ static HRESULT WINAPI transform_ProcessOutput(IMFTransform *iface, DWORD flags, 
 
     len = size;
     ret = winedmo_decoder_process_output(decoder->winedmo, &format, data, &len, &time, &duration);
-    IMFMediaBuffer_Unlock(buffer);
+    if (buffer_2d)
+    {
+        IMF2DBuffer_Unlock2D(buffer_2d);
+        IMF2DBuffer_Release(buffer_2d);
+    }
+    else
+        IMFMediaBuffer_Unlock(buffer);
 
     switch (ret)
     {
