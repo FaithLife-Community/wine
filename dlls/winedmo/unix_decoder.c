@@ -179,12 +179,10 @@ NTSTATUS decoder_create( void *arg )
         goto failed;
 
     ctx->pkt_timebase = (AVRational){1, 10000000};
-    /* Software H.264 decoding of HD video needs several cores to keep up,
-     * and most streams have one slice per frame, so use frame threading too.
-     * It holds back one frame per thread, which Media Foundation decoders
-     * may do; they return them on drain. */
+    /* Frame threading holds back one frame per thread before the first output,
+     * Media Foundation decoders return frames as soon as they can. */
     ctx->thread_count = 0;
-    ctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+    ctx->thread_type = FF_THREAD_SLICE;
 
     if (IsEqualGUID( &params->major, &MFMediaType_Video ))
     {
