@@ -24,6 +24,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include "unix_private.h"
 
@@ -48,7 +49,7 @@ struct decoder
     AVCodecContext *ctx;
     AVFrame *frame;
     AVFrame *sw_frame; /* system memory copy of a hardware decoded frame */
-    BOOL vaapi_direct_read; /* the VA-API driver can't copy frames to planar YUV */
+    BOOL vaapi_no_map; /* VA-API frames can't be mapped for reading */
     BOOL has_frame; /* frame holds output that hasn't been returned yet */
 };
 
@@ -594,33 +595,34 @@ NTSTATUS decoder_process_output( void *arg )
         }
         if (frame->hw_frames_ctx)
         {
-            /* Copy a hardware decoded frame to system memory. With VA-API, ask for
-             * planar YUV rather than the surface's NV12: FFmpeg then has the driver
-             * copy the surface into an image (vaGetImage) instead of mapping it
-             * directly, and reading a mapped surface is very slow on some GPUs (AMD:
-             * about 13 ms per 1080p frame). Other devices only read back their own
-             * format. */
+            /* Get a hardware decoded frame into system memory. A VA-API frame is
+             * mapped for reading, which has the driver copy the surface into an
+             * image (vaGetImage), and is written out from there; transferring it
+             * would copy it once more. Other devices can only transfer. */
             AVFrame *sw_frame = decoder->sw_frame;
+            struct timespec t0, t1;
 
-            ret = -1;
-            if (frame->format == AV_PIX_FMT_VAAPI && !decoder->vaapi_direct_read)
+            if (TRACE_ON(dmo)) clock_gettime( CLOCK_MONOTONIC, &t0 );
+            if (frame->format == AV_PIX_FMT_VAAPI && !decoder->vaapi_no_map
+                    && (ret = av_hwframe_map( sw_frame, frame, AV_HWFRAME_MAP_READ )) < 0)
             {
-                sw_frame->format = AV_PIX_FMT_YUV420P;
-                if ((ret = av_hwframe_transfer_data( sw_frame, frame, 0 )) < 0)
-                {
-                    WARN( "Failed to read back VA-API frame as YUV420P, error %s, reading it directly\n",
-                          debugstr_averr( ret ) );
-                    decoder->vaapi_direct_read = TRUE;
-                    av_frame_unref( sw_frame );
-                }
+                WARN( "Failed to map VA-API frame, error %s, transferring instead\n", debugstr_averr( ret ) );
+                decoder->vaapi_no_map = TRUE;
+                av_frame_unref( sw_frame );
             }
-            if ((ret < 0 && (ret = av_hwframe_transfer_data( sw_frame, frame, 0 )) < 0)
+            if ((!sw_frame->buf[0] && (ret = av_hwframe_transfer_data( sw_frame, frame, 0 )) < 0)
                     || (ret = av_frame_copy_props( sw_frame, frame )) < 0)
             {
                 WARN( "Failed to read back hardware frame, error %s\n", debugstr_averr( ret ) );
                 av_frame_unref( sw_frame );
                 av_frame_unref( frame );
                 return STATUS_PENDING;
+            }
+            if (TRACE_ON(dmo))
+            {
+                clock_gettime( CLOCK_MONOTONIC, &t1 );
+                TRACE( "Read back %s frame in %.2f ms\n", av_get_pix_fmt_name( sw_frame->format ),
+                       (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6 );
             }
             av_frame_unref( frame );
             av_frame_move_ref( frame, sw_frame );
@@ -630,6 +632,8 @@ NTSTATUS decoder_process_output( void *arg )
 
     if (decoder->ctx->codec_type == AVMEDIA_TYPE_VIDEO)
     {
+        struct timespec t0, t1;
+
         /* the output may be larger, padded to the coded size, but not smaller
          * or more than one macroblock larger */
         if (frame->width > format->width || frame->height > format->height
@@ -640,7 +644,15 @@ NTSTATUS decoder_process_output( void *arg )
             format->height = frame->height;
             return STATUS_MEDIA_CHANGED;
         }
+
+        if (TRACE_ON(dmo)) clock_gettime( CLOCK_MONOTONIC, &t0 );
         status = write_video_frame( frame, format, (BYTE *)(UINT_PTR)sample->data, &sample->size );
+        if (TRACE_ON(dmo) && !status && sample->data)
+        {
+            clock_gettime( CLOCK_MONOTONIC, &t1 );
+            TRACE( "Wrote %s frame in %.2f ms\n", av_get_pix_fmt_name( frame->format ),
+                   (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6 );
+        }
         sample->duration = frame_duration( frame );
     }
     else
