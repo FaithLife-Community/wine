@@ -48,6 +48,7 @@ struct decoder
     AVCodecContext *ctx;
     AVFrame *frame;
     AVFrame *sw_frame; /* system memory copy of a hardware decoded frame */
+    BOOL vaapi_direct_read; /* the VA-API driver can't copy frames to planar YUV */
     BOOL has_frame; /* frame holds output that hasn't been returned yet */
 };
 
@@ -593,10 +594,27 @@ NTSTATUS decoder_process_output( void *arg )
         }
         if (frame->hw_frames_ctx)
         {
-            /* copy a hardware decoded frame to system memory, usually as NV12 */
+            /* Copy a hardware decoded frame to system memory. With VA-API, ask for
+             * planar YUV rather than the surface's NV12: FFmpeg then has the driver
+             * copy the surface into an image (vaGetImage) instead of mapping it
+             * directly, and reading a mapped surface is very slow on some GPUs (AMD:
+             * about 13 ms per 1080p frame). Other devices only read back their own
+             * format. */
             AVFrame *sw_frame = decoder->sw_frame;
 
-            if ((ret = av_hwframe_transfer_data( sw_frame, frame, 0 )) < 0
+            ret = -1;
+            if (frame->format == AV_PIX_FMT_VAAPI && !decoder->vaapi_direct_read)
+            {
+                sw_frame->format = AV_PIX_FMT_YUV420P;
+                if ((ret = av_hwframe_transfer_data( sw_frame, frame, 0 )) < 0)
+                {
+                    WARN( "Failed to read back VA-API frame as YUV420P, error %s, reading it directly\n",
+                          debugstr_averr( ret ) );
+                    decoder->vaapi_direct_read = TRUE;
+                    av_frame_unref( sw_frame );
+                }
+            }
+            if ((ret < 0 && (ret = av_hwframe_transfer_data( sw_frame, frame, 0 )) < 0)
                     || (ret = av_frame_copy_props( sw_frame, frame )) < 0)
             {
                 WARN( "Failed to read back hardware frame, error %s\n", debugstr_averr( ret ) );
