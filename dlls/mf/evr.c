@@ -1975,6 +1975,14 @@ static HRESULT WINAPI video_renderer_clock_sink_OnClockStart(IMFClockStateSink *
                         &GUID_NULL, S_OK, NULL);
         }
     }
+    else
+    {
+        /* Starting again from paused or running, e.g. at a new position: the session
+         * waits for every stream to report it has started. */
+        for (i = 0; i < renderer->stream_count; ++i)
+            IMFMediaEventQueue_QueueEventParamVar(renderer->streams[i]->event_queue, MEStreamSinkStarted,
+                    &GUID_NULL, S_OK, NULL);
+    }
 
     IMFVideoPresenter_OnClockStart(renderer->presenter, systime, offset);
 
