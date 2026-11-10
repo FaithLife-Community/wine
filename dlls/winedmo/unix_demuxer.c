@@ -258,7 +258,13 @@ static NTSTATUS demuxer_filter_packet( struct demuxer *demuxer, AVPacket **packe
             if (!(ret = av_bsf_receive_packet( stream->filter, *packet ))) return STATUS_SUCCESS;
             if (ret == AVERROR_EOF) stream->eos = TRUE;
             if (!ret || ret == AVERROR_EOF || ret == AVERROR(EAGAIN)) ret = 0;
-            else WARN( "Failed to read packet from filter, error %s.\n", debugstr_averr( ret ) );
+            else
+            {
+                /* The filter keeps the bad packet and refuses every later one, skip it instead. */
+                WARN( "Failed to read packet from filter, error %s.\n", debugstr_averr( ret ) );
+                av_bsf_flush( stream->filter );
+                ret = 0;
+            }
             stream = demuxer->last_stream = NULL;
         }
 
