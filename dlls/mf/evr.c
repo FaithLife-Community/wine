@@ -103,8 +103,8 @@ struct video_renderer
 
     CRITICAL_SECTION cs;
     /* Guards state, the stream array and the streams' sample_needed flags for
-     * sample requests from the mixer. Never held while calling out: the mixer
-     * may request samples from a presenter thread that holds the presenter's
+     * events from the mixer and presenter (IMediaEventSink::Notify). Never held
+     * while calling out: they notify from threads that hold the presenter's
      * lock, while the renderer calls into the presenter with renderer->cs held. */
     CRITICAL_SECTION request_cs;
 };
@@ -2310,10 +2310,13 @@ static HRESULT WINAPI video_renderer_event_sink_Notify(IMediaEventSink *iface, L
 
     TRACE("%p, %ld, %Id, %Id.\n", iface, event, param1, param2);
 
+    /* Not under renderer->cs, see request_cs: presenters notify from their own
+     * threads with their locks held (e.g. EC_PROCESSING_LATENCY for every frame),
+     * while the renderer calls into the presenter with renderer->cs held. */
+    EnterCriticalSection(&renderer->request_cs);
+
     if (event == EC_SAMPLE_NEEDED)
     {
-        /* Not under renderer->cs, see request_cs. */
-        EnterCriticalSection(&renderer->request_cs);
         idx = param1;
         if (idx >= renderer->stream_count)
             hr = MF_E_INVALIDSTREAMNUMBER;
@@ -2328,13 +2331,8 @@ static HRESULT WINAPI video_renderer_event_sink_Notify(IMediaEventSink *iface, L
                Mark such streams here, and issue requests later in OnClockStart(). */
             renderer->streams[idx]->sample_needed = TRUE;
         }
-        LeaveCriticalSection(&renderer->request_cs);
-        return hr;
     }
-
-    EnterCriticalSection(&renderer->cs);
-
-    if (event == EC_DISPLAY_CHANGED)
+    else if (event == EC_DISPLAY_CHANGED)
     {
         for (idx = 0; idx < renderer->stream_count; ++idx)
             IMFMediaEventQueue_QueueEventParamVar(renderer->streams[idx]->event_queue,
@@ -2355,7 +2353,7 @@ static HRESULT WINAPI video_renderer_event_sink_Notify(IMediaEventSink *iface, L
         hr = MF_E_UNEXPECTED;
     }
 
-    LeaveCriticalSection(&renderer->cs);
+    LeaveCriticalSection(&renderer->request_cs);
 
     return hr;
 }
