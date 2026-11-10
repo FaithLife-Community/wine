@@ -179,7 +179,10 @@ NTSTATUS decoder_create( void *arg )
         goto failed;
 
     ctx->pkt_timebase = (AVRational){1, 10000000};
+    /* Frame threading holds back one frame per thread before the first output,
+     * Media Foundation decoders return frames as soon as they can. */
     ctx->thread_count = 0;
+    ctx->thread_type = FF_THREAD_SLICE;
 
     if (IsEqualGUID( &params->major, &MFMediaType_Video ))
     {

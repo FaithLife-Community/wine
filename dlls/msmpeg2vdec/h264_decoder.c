@@ -605,6 +605,34 @@ static HRESULT WINAPI transform_ProcessOutput(IMFTransform *iface, DWORD flags, 
     }
     format.stride = abs((INT32)stride);
 
+    /* Find out if a frame is ready before locking the output buffer: with the
+     * EVR, that maps a Direct3D surface, which is far too slow to do for every
+     * call that ends up asking for more input. */
+    len = 0;
+    ret = winedmo_decoder_process_output(decoder->winedmo, &format, NULL, &len, &time, &duration);
+    switch (ret)
+    {
+    case STATUS_BUFFER_TOO_SMALL:
+        break;
+
+    case STATUS_PENDING:
+    case STATUS_END_OF_FILE:
+        return MF_E_TRANSFORM_NEED_MORE_INPUT;
+
+    case STATUS_MEDIA_CHANGED:
+        TRACE("Frame size changed to %ux%u.\n", format.width, format.height);
+        decoder->width = format.width;
+        decoder->height = format.height;
+        update_output_info_size(decoder);
+        samples->dwStatus |= MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE;
+        *status |= MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE;
+        return MF_E_TRANSFORM_STREAM_CHANGE;
+
+    default:
+        ERR("Failed to decode, status %#lx.\n", ret);
+        return E_FAIL;
+    }
+
     /* With the EVR downstream, the session hands us its Direct3D surface samples,
      * which only support 2D locking with their own pitch. */
     if (FAILED(hr = IMFSample_GetBufferCount(samples->pSample, &buffer_count)) || buffer_count != 1)
