@@ -27,17 +27,13 @@ WINE_DEFAULT_DEBUG_CHANNEL(dmo);
 
 extern HRESULT ffmpeg_h264_decoder_create(REFIID riid, void **out);
 
-/* FFmpeg decoders are used when Wine's FFmpeg media source is enabled, or
- * when they are asked for explicitly; GStreamer stays the fallback. */
+/* The FFmpeg decoders are used first when asked for with DisableGstDecoders,
+ * otherwise only when the GStreamer decoder can't be created. */
 static BOOL use_ffmpeg_decoders(void)
 {
     DWORD value, size = sizeof(value);
 
     if (!RegGetValueW(HKEY_CURRENT_USER, L"Software\\Wine\\MediaFoundation", L"DisableGstDecoders",
-            RRF_RT_REG_DWORD, NULL, &value, &size))
-        return !!value;
-    size = sizeof(value);
-    if (!RegGetValueW(HKEY_CURRENT_USER, L"Software\\Wine\\MediaFoundation", L"DisableGstByteStreamHandler",
             RRF_RT_REG_DWORD, NULL, &value, &size))
         return !!value;
     return FALSE;
