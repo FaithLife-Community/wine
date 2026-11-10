@@ -127,6 +127,7 @@ static NTSTATUS process_attach( void *arg )
     TRACE( "FFmpeg support:\n" );
     TRACE( "  avutil version %s\n", debugstr_version( avutil_version() ) );
     TRACE( "  avformat version %s\n", debugstr_version( avformat_version() ) );
+    TRACE( "  avcodec version %s\n", debugstr_version( avcodec_version() ) );
 
     TRACE( "available demuxers:\n" );
     for (opaque = NULL; (demuxer = av_demuxer_iterate( &opaque ));)
@@ -157,6 +158,12 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     X( demuxer_stream_lang ),
     X( demuxer_stream_name ),
     X( demuxer_stream_type ),
+
+    X( decoder_create ),
+    X( decoder_destroy ),
+    X( decoder_process_input ),
+    X( decoder_process_output ),
+    X( decoder_flush ),
 };
 
 C_ASSERT(ARRAY_SIZE(__wine_unix_call_funcs) == unix_funcs_count);
@@ -220,6 +227,12 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
     X( demuxer_stream_lang ),
     X( demuxer_stream_name ),
     X( demuxer_stream_type ),
+
+    X( decoder_create ),
+    X( decoder_destroy ),
+    X( decoder_process_input ),
+    X( decoder_process_output ),
+    X( decoder_flush ),
 };
 
 C_ASSERT(ARRAY_SIZE(__wine_unix_call_wow64_funcs) == unix_funcs_count);

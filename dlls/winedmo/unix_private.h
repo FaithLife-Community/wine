@@ -52,6 +52,13 @@ extern NTSTATUS demuxer_stream_lang( void * );
 extern NTSTATUS demuxer_stream_name( void * );
 extern NTSTATUS demuxer_stream_type( void * );
 
+/* unix_decoder.c */
+extern NTSTATUS decoder_create( void * );
+extern NTSTATUS decoder_destroy( void * );
+extern NTSTATUS decoder_process_input( void * );
+extern NTSTATUS decoder_process_output( void * );
+extern NTSTATUS decoder_flush( void * );
+
 /* unix_media_type.c */
 extern NTSTATUS media_type_from_codec_params( const AVCodecParameters *params, const AVRational *sar, const AVRational *fps,
                                               UINT32 align, struct media_type *media_type );

@@ -53,4 +53,27 @@ NTSTATUS CDECL winedmo_demuxer_stream_name( struct winedmo_demuxer demuxer, UINT
 NTSTATUS CDECL winedmo_demuxer_stream_type( struct winedmo_demuxer demuxer, UINT stream,
                                             GUID *major, union winedmo_format **format );
 
+struct winedmo_decoder { UINT64 handle; };
+
+/* The format a decoder writes its output in. On STATUS_MEDIA_CHANGED, the frame
+ * size (video) or rate and channel count (audio) are updated to the new ones. */
+struct winedmo_frame_format
+{
+    GUID subtype;
+    UINT32 width;
+    UINT32 height;
+    UINT32 stride;
+    UINT32 rate;
+    UINT32 channels;
+};
+
+NTSTATUS CDECL winedmo_decoder_create( const GUID *major, const union winedmo_format *format, struct winedmo_decoder *decoder );
+NTSTATUS CDECL winedmo_decoder_destroy( struct winedmo_decoder *decoder );
+NTSTATUS CDECL winedmo_decoder_process_input( struct winedmo_decoder decoder, const BYTE *data, UINT size,
+                                              INT64 pts, INT64 duration );
+NTSTATUS CDECL winedmo_decoder_process_output( struct winedmo_decoder decoder, struct winedmo_frame_format *format,
+                                               BYTE *data, UINT *size, INT64 *pts, INT64 *duration );
+NTSTATUS CDECL winedmo_decoder_drain( struct winedmo_decoder decoder );
+NTSTATUS CDECL winedmo_decoder_flush( struct winedmo_decoder decoder );
+
 #endif /* __WINE_WINEDMO_H */
