@@ -26,6 +26,7 @@
 #include "ntstatus.h"
 #include "windef.h"
 #include "winbase.h"
+#include "winreg.h"
 #include "winerror.h"
 #include "msidefs.h"
 #include "winuser.h"
@@ -1450,6 +1451,35 @@ static UINT defer_custom_action( MSIPACKAGE *package, const WCHAR *action, UINT 
     return ERROR_SUCCESS;
 }
 
+/* Custom actions whose failure the user (or a tool managing the prefix) has
+ * chosen to ignore, as if they had msidbCustomActionTypeContinue set: a list
+ * of action names in HKCU\Software\Wine\MSI\IgnoreFailedActions, either
+ * REG_MULTI_SZ or REG_SZ separated by ';'. Useful for actions that need
+ * features Wine doesn't have and whose failure would roll the whole
+ * installation back. */
+static BOOL action_failure_ignored( const WCHAR *action )
+{
+    DWORD size = 0, type;
+    WCHAR *list, *p;
+    BOOL ret = FALSE;
+
+    if (RegGetValueW( HKEY_CURRENT_USER, L"Software\\Wine\\MSI", L"IgnoreFailedActions",
+                      RRF_RT_REG_SZ | RRF_RT_REG_MULTI_SZ, &type, NULL, &size ))
+        return FALSE;
+    /* room for the list's double null terminator even if the value lacks it */
+    if (!(list = calloc( 1, size + 2 * sizeof(WCHAR) ))) return FALSE;
+    if (!RegGetValueW( HKEY_CURRENT_USER, L"Software\\Wine\\MSI", L"IgnoreFailedActions",
+                       RRF_RT_REG_SZ | RRF_RT_REG_MULTI_SZ, &type, list, &size ))
+    {
+        if (type == REG_SZ)
+            for (p = list; *p; p++) if (*p == ';') *p = 0;
+        for (p = list; *p; p += wcslen( p ) + 1)
+            if (!wcscmp( p, action )) ret = TRUE;
+    }
+    free( list );
+    return ret;
+}
+
 UINT ACTION_CustomAction(MSIPACKAGE *package, const WCHAR *action)
 {
     UINT rc = ERROR_SUCCESS;
@@ -1476,6 +1506,12 @@ UINT ACTION_CustomAction(MSIPACKAGE *package, const WCHAR *action)
 
     TRACE("Handling custom action %s (%x %s %s)\n",debugstr_w(action),type,
           debugstr_w(source), debugstr_w(target));
+
+    if (!(type & msidbCustomActionTypeContinue) && action_failure_ignored( action ))
+    {
+        WARN( "continuing past failures of custom action %s, as configured\n", debugstr_w(action) );
+        type |= msidbCustomActionTypeContinue;
+    }
 
     /* handle some of the deferred actions */
     if (type & msidbCustomActionTypeTSAware)
