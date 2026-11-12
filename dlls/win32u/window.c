@@ -2789,6 +2789,12 @@ BOOL WINAPI NtUserUpdateLayeredWindow( HWND hwnd, HDC hdc_dst, const POINT *pts_
         OffsetRect( &rect, -rect.left, -rect.top );
         intersect_rect( &rect, &rect, &surface_rect );
 
+        /* Set the layered attributes first: a new surface has none, and the window
+         * may be painted and its surface flushed from another thread meanwhile,
+         * which would make the pixels we draw opaque. */
+        if (!(flags & ULW_COLORKEY)) key = CLR_INVALID;
+        window_surface_set_layered( surface, key, -1, 0xff000000 );
+
         if (!(hdc = NtGdiCreateCompatibleDC( 0 ))) goto done;
         window_surface_lock( surface );
         NtGdiSelectBitmap( hdc, surface->color_bitmap );
@@ -2811,9 +2817,6 @@ BOOL WINAPI NtUserUpdateLayeredWindow( HWND hwnd, HDC hdc_dst, const POINT *pts_
 
         NtGdiDeleteObjectApp( hdc );
         window_surface_unlock( surface );
-
-        if (!(flags & ULW_COLORKEY)) key = CLR_INVALID;
-        window_surface_set_layered( surface, key, -1, 0xff000000 );
 
         user_driver->pUpdateLayeredWindow( hwnd, source_alpha, flags );
         window_surface_flush( surface );
