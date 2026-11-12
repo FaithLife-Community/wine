@@ -1835,18 +1835,6 @@ void macdrv_window_lost_focus(HWND hwnd, const macdrv_event *event)
 
 
 /***********************************************************************
- *              macdrv_app_activated
- *
- * Handler for APP_ACTIVATED events.
- */
-void macdrv_app_activated(void)
-{
-    TRACE("\n");
-    macdrv_UpdateClipboard();
-}
-
-
-/***********************************************************************
  *              macdrv_app_deactivated
  *
  * Handler for APP_DEACTIVATED events.
@@ -1922,6 +1910,8 @@ void macdrv_window_did_unminimize(HWND hwnd)
     {
         TRACE("restoring win %p/%p\n", hwnd, data->cocoa_window);
         release_win_data(data);
+        if (can_window_become_foreground(hwnd))
+            NtUserSetForegroundWindowInternal(hwnd);
         NtUserSetActiveWindow(hwnd);
         send_message(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0);
         return;

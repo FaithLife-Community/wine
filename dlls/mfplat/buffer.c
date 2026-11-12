@@ -449,6 +449,11 @@ static HRESULT WINAPI d3d9_surface_buffer_Lock(IMFMediaBuffer *iface, BYTE **dat
                         buffer->_2d.width, buffer->_2d.height);
                 IDirect3DSurface9_UnlockRect(buffer->d3d9_surface.surface);
             }
+            else
+            {
+                free(buffer->_2d.linear_buffer);
+                buffer->_2d.linear_buffer = NULL;
+            }
         }
     }
 
@@ -1081,6 +1086,11 @@ static HRESULT WINAPI dxgi_surface_buffer_Lock(IMFMediaBuffer *iface, BYTE **dat
                 copy_image(buffer, buffer->_2d.linear_buffer, buffer->_2d.width, buffer->dxgi_surface.map_desc.pData,
                         buffer->dxgi_surface.map_desc.RowPitch, buffer->_2d.width, buffer->_2d.height);
             }
+            else
+            {
+                free(buffer->_2d.linear_buffer);
+                buffer->_2d.linear_buffer = NULL;
+            }
         }
     }
 
@@ -1515,8 +1525,13 @@ static HRESULT d3d12_surface_buffer_map(struct buffer *buffer, MF2DBuffer_LockFl
             hr = d3d12_surface_buffer_create_transfer_resource(buffer, transfer, flags);
         buffer->d3d12_surface.transfer = *transfer;
 
-        if (SUCCEEDED(hr) && flags != MF2DBuffer_LockFlags_Write)
-            hr = d3d12_surface_buffer_copy_transfer_resource(buffer, flags);
+        if (SUCCEEDED(hr))
+        {
+            if (flags != MF2DBuffer_LockFlags_Write)
+                hr = d3d12_surface_buffer_copy_transfer_resource(buffer, flags);
+            else if (buffer->d3d12_surface.fence)
+                hr = ID3D12Fence_SetEventOnCompletion(buffer->d3d12_surface.fence, buffer->d3d12_surface.fence_value, NULL);
+        }
     }
 
     if (SUCCEEDED(hr))
