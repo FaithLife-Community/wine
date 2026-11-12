@@ -7468,7 +7468,7 @@ static UINT ITERATE_RemoveExistingProducts( MSIRECORD *rec, LPVOID param )
     MSIPACKAGE *package = param;
     const WCHAR *property = MSI_RecordGetString( rec, 7 );
     int attrs = MSI_RecordGetInteger( rec, 5 );
-    UINT len = ARRAY_SIZE( L"msiexec /qn /i %s REMOVE=%s" );
+    UINT len = ARRAY_SIZE( L"msiexec /qn /i %s REMOVE=%s UPGRADINGPRODUCTCODE=%s" );
     WCHAR *product, *features, *cmd;
     STARTUPINFOW si;
     PROCESS_INFORMATION info;
@@ -7479,7 +7479,7 @@ static UINT ITERATE_RemoveExistingProducts( MSIRECORD *rec, LPVOID param )
 
     deformat_string( package, MSI_RecordGetString( rec, 6 ), &features );
 
-    len += lstrlenW( product );
+    len += lstrlenW( product ) + lstrlenW( package->ProductCode );
     if (features)
         len += lstrlenW( features );
     else
@@ -7491,7 +7491,8 @@ static UINT ITERATE_RemoveExistingProducts( MSIRECORD *rec, LPVOID param )
         free( features );
         return ERROR_OUTOFMEMORY;
     }
-    swprintf( cmd, len, L"msiexec /qn /i %s REMOVE=%s", product, features ? features : L"ALL" );
+    swprintf( cmd, len, L"msiexec /qn /i %s REMOVE=%s UPGRADINGPRODUCTCODE=%s", product,
+              features ? features : L"ALL", package->ProductCode );
     free( product );
     free( features );
 
