@@ -2709,11 +2709,12 @@ BOOL WINAPI NtUserUpdateLayeredWindow( HWND hwnd, HDC hdc_dst, const POINT *pts_
 {
     DWORD swp_flags = SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW;
     BYTE source_alpha = blend ? blend->SourceConstantAlpha : 0xff;
+    struct window_surface *surface, *previous = NULL;
     struct window_rects new_rects;
-    struct window_surface *surface;
     RECT surface_rect;
     SIZE offset;
     BOOL ret = FALSE;
+    WND *win;
 
     if (flags & ~(ULW_COLORKEY | ULW_ALPHA | ULW_OPAQUE | ULW_EX_NORESIZE) ||
         !(get_window_long( hwnd, GWL_EXSTYLE ) & WS_EX_LAYERED) ||
@@ -2757,11 +2758,22 @@ BOOL WINAPI NtUserUpdateLayeredWindow( HWND hwnd, HDC hdc_dst, const POINT *pts_
         swp_flags &= ~SWP_NOSIZE;
     }
 
-    TRACE( "window %p new_rects %s\n", hwnd, debugstr_window_rects( &new_rects ) );
+    TRACE( "window %p new_rects %s dirty %s\n", hwnd, debugstr_window_rects( &new_rects ),
+           wine_dbgstr_rect( dirty ) );
+
+    if ((win = get_win_ptr( hwnd )) && win != WND_DESKTOP && win != WND_OTHER_PROCESS)
+    {
+        if ((previous = win->surface)) window_surface_add_ref( previous );
+        release_win_ptr( win );
+    }
 
     surface = get_window_surface( hwnd, swp_flags, TRUE, &new_rects, &surface_rect );
     apply_window_pos( hwnd, 0, swp_flags, surface, &new_rects, NULL );
-    if (!surface) return FALSE;
+    if (!surface)
+    {
+        if (previous) window_surface_release( previous );
+        return FALSE;
+    }
 
     if (!hdc_src || surface == &dummy_surface || NtUserWindowFromDC( hdc_src ) == hwnd)
     {
@@ -2781,7 +2793,11 @@ BOOL WINAPI NtUserUpdateLayeredWindow( HWND hwnd, HDC hdc_dst, const POINT *pts_
         window_surface_lock( surface );
         NtGdiSelectBitmap( hdc, surface->color_bitmap );
 
-        if (dirty) intersect_rect( &rect, &rect, dirty );
+        /* A new surface (the first update, or a new size) holds none of the
+         * window's earlier contents, so update all of it: applications such as
+         * WPF only pass the part that changed since their last update. */
+        if (dirty && surface == previous) intersect_rect( &rect, &rect, dirty );
+        else if (dirty) TRACE( "new surface %p, updating all of %s\n", surface, wine_dbgstr_rect( &rect ) );
         NtGdiPatBlt( hdc, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, BLACKNESS );
 
         src_rect = rect;
@@ -2805,6 +2821,7 @@ BOOL WINAPI NtUserUpdateLayeredWindow( HWND hwnd, HDC hdc_dst, const POINT *pts_
 
 done:
     window_surface_release( surface );
+    if (previous) window_surface_release( previous );
     return ret;
 }
 
