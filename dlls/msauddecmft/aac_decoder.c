@@ -388,7 +388,7 @@ static HRESULT WINAPI transform_SetOutputType(IMFTransform *iface, DWORD id, IMF
 {
     struct aac_decoder *decoder = impl_from_IMFTransform(iface);
     WAVEFORMATEXTENSIBLE *format, wfx;
-    UINT32 size;
+    UINT32 size, value;
     HRESULT hr;
     ULONG i;
 
@@ -426,6 +426,16 @@ static HRESULT WINAPI transform_SetOutputType(IMFTransform *iface, DWORD id, IMF
 
     if (!wfx.Format.wBitsPerSample || !wfx.Format.nChannels || !wfx.Format.nSamplesPerSec)
         return MF_E_INVALIDMEDIATYPE;
+
+    /* The decoder doesn't resample or remix, so only accept the stream's own
+     * rate and channels; the topology loader then adds a resampler if needed. */
+    if (SUCCEEDED(IMFMediaType_GetUINT32(decoder->input_type, &MF_MT_AUDIO_NUM_CHANNELS, &value))
+            && value && value != wfx.Format.nChannels)
+        return MF_E_INVALIDMEDIATYPE;
+    if (SUCCEEDED(IMFMediaType_GetUINT32(decoder->input_type, &MF_MT_AUDIO_SAMPLES_PER_SECOND, &value))
+            && value && value != wfx.Format.nSamplesPerSec)
+        return MF_E_INVALIDMEDIATYPE;
+
     if (flags & MFT_SET_TYPE_TEST_ONLY)
         return S_OK;
 
