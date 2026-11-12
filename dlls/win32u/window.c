@@ -33,6 +33,52 @@
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(win);
+WINE_DECLARE_DEBUG_CHANNEL(layered);
+
+/* DEBUG ONLY (not for upstream): describe the alpha of the picture passed to
+ * UpdateLayeredWindow, to tell whether a popup's shadow arrives transparent. */
+static void trace_layered_source( HWND hwnd, HDC hdc_src, const RECT *src )
+{
+    static const char *names[] = { "a0", "a1-63", "a64-191", "a192-254", "a255" };
+    unsigned int counts[5] = {0}, not_premultiplied = 0;
+    char samples[256], *p = samples;
+    DIBSECTION dib;
+    const BYTE *bits;
+    int x, y, stride;
+
+    if (!TRACE_ON(layered)) return;
+    if (NtGdiExtGetObjectW( NtGdiGetDCObject( hdc_src, NTGDI_OBJ_SURF ), sizeof(dib), &dib ) != sizeof(dib) ||
+        dib.dsBm.bmBitsPixel != 32 || !dib.dsBm.bmBits)
+    {
+        TRACE_(layered)( "hwnd %p: source is not a 32-bit DIB section\n", hwnd );
+        return;
+    }
+    bits = dib.dsBm.bmBits;
+    stride = dib.dsBm.bmWidthBytes;
+#define PIXEL(x, y) (bits + (dib.dsBmih.biHeight > 0 ? dib.dsBm.bmHeight - 1 - (y) : (y)) * stride + (x) * 4)
+    for (y = max( src->top, 0 ); y < min( src->bottom, dib.dsBm.bmHeight ); y++)
+        for (x = max( src->left, 0 ); x < min( src->right, dib.dsBm.bmWidth ); x++)
+        {
+            const BYTE *px = PIXEL( x, y );
+            BYTE a = px[3];
+            counts[a == 0 ? 0 : a < 64 ? 1 : a < 192 ? 2 : a < 255 ? 3 : 4]++;
+            if (px[0] > a || px[1] > a || px[2] > a) not_premultiplied++;
+        }
+    /* samples: right edge, bottom edge, bottom-right corner (where shadows are), centre */
+    {
+        int sx[4] = { src->right - 2, (src->left + src->right) / 2, src->right - 2, (src->left + src->right) / 2 };
+        int sy[4] = { (src->top + src->bottom) / 2, src->bottom - 2, src->bottom - 2, (src->top + src->bottom) / 2 };
+        for (x = 0; x < 4; x++)
+        {
+            if (sx[x] < 0 || sy[x] < 0 || sx[x] >= dib.dsBm.bmWidth || sy[x] >= dib.dsBm.bmHeight) continue;
+            p += snprintf( p, samples + sizeof(samples) - p, " (%d,%d)=%08x", sx[x], sy[x], *(const UINT *)PIXEL( sx[x], sy[x] ) );
+        }
+    }
+#undef PIXEL
+    TRACE_(layered)( "hwnd %p src %s: %s %u, %s %u, %s %u, %s %u, %s %u; not premultiplied %u; argb%s\n",
+                     hwnd, wine_dbgstr_rect( src ), names[0], counts[0], names[1], counts[1], names[2], counts[2],
+                     names[3], counts[3], names[4], counts[4], not_premultiplied, samples );
+}
 
 #define USER_HANDLE_TO_INDEX(hwnd) ((LOWORD(hwnd) - FIRST_USER_HANDLE) >> 1)
 #define USER_HANDLE_FROM_INDEX(index, generation) UlongToHandle( (index << 1) + FIRST_USER_HANDLE + (generation << 16) )
@@ -2803,6 +2849,7 @@ BOOL WINAPI NtUserUpdateLayeredWindow( HWND hwnd, HDC hdc_dst, const POINT *pts_
         src_rect = rect;
         if (pts_src) OffsetRect( &src_rect, pts_src->x, pts_src->y );
         NtGdiTransformPoints( hdc_src, (POINT *)&src_rect, (POINT *)&src_rect, 2, NtGdiDPtoLP );
+        trace_layered_source( hwnd, hdc_src, &src_rect );
 
         ret = NtGdiAlphaBlend( hdc, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
                                hdc_src, src_rect.left, src_rect.top, src_rect.right - src_rect.left, src_rect.bottom - src_rect.top,
