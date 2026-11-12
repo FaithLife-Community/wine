@@ -186,6 +186,7 @@ static void *working_set_limit   = (void *)0x7fff0000;
 #endif
 
 static void *host_addr_space_limit;  /* top of the host virtual address space */
+static ULONG_PTR top_down_wow_offset;  /* offset for top-down randomization in wow64 */
 
 static struct file_view *arm64ec_view;
 
@@ -276,13 +277,6 @@ static inline BOOL is_beyond_limit( const void *addr, size_t size, const void *l
 static inline BOOL is_vprot_exec_write( BYTE vprot )
 {
     return (vprot & VPROT_EXEC) && (vprot & (VPROT_WRITE | VPROT_WRITECOPY));
-}
-
-/* address-space layout randomization */
-static inline BOOL use_aslr(void)
-{
-    return (main_image_info.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA) &&
-           (main_image_info.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE);
 }
 
 /* mmap() anonymous memory at a fixed address */
@@ -1951,6 +1945,15 @@ static void *alloc_reserved_area( void *limit_low, void *limit_high, size_t size
         hint = mem_area_base( area );
         low_range.end = (char *)low_range.end + reserve_size;
     }
+#else
+    if (top_down)
+    {
+        if (limit_high == user_space_limit) limit_high = high_range.end;
+    }
+    else
+    {
+        if (limit_low == address_space_start) limit_low = low_range.start;
+    }
 #endif
     return map_reserved_area( limit_low, limit_high, size, top_down, unix_prot, align_mask );
 }
@@ -2074,6 +2077,7 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
 
         if (limit_low && (void *)limit_low > start) start = (void *)limit_low;
         if (limit_high && (void *)limit_high < end) end = (char *)limit_high + 1;
+        if (top_down && limit_high == user_space_wow_limit) end = (char *)end - top_down_wow_offset;
 
         if ((ptr = alloc_reserved_area( start, end, host_size, top_down, unix_prot, align_mask )))
         {
@@ -3857,6 +3861,58 @@ static void set_large_address_space(void)
     user_space_limit = working_set_limit = address_space_limit;
 }
 
+/* randomize address space layout after the main exe is loaded */
+static void randomize_address_space(void)
+{
+    UINT random[2];
+    UINT_PTR offset;
+
+    switch (mitigation_options[0] & PROCESS_CREATION_MITIGATION_POLICY_BOTTOM_UP_ASLR_MASK)
+    {
+    case PROCESS_CREATION_MITIGATION_POLICY_BOTTOM_UP_ASLR_ALWAYS_OFF:
+        return;
+    case PROCESS_CREATION_MITIGATION_POLICY_BOTTOM_UP_ASLR_ALWAYS_ON:
+        break;
+    default:
+        if (main_image_info.ImageCharacteristics & IMAGE_FILE_RELOCS_STRIPPED) return;
+        if (!(main_image_info.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE)) return;
+        break;
+    }
+
+    get_random( random, sizeof(random) );
+
+    /* randomize low range */
+
+    offset = random[0] >> 8;
+    switch (mitigation_options[0] & PROCESS_CREATION_MITIGATION_POLICY_HIGH_ENTROPY_ASLR_MASK)
+    {
+    default:
+        if (!(main_image_info.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA)) break;
+        /* fall through */
+    case PROCESS_CREATION_MITIGATION_POLICY_HIGH_ENTROPY_ASLR_ALWAYS_ON:
+        if (is_machine_64bit( main_image_info.Machine )) offset = limit_4g + ((ULONG_PTR)random[0] << 8);
+        break;
+    case PROCESS_CREATION_MITIGATION_POLICY_HIGH_ENTROPY_ASLR_ALWAYS_OFF:
+        break;
+    }
+    offset &= (ULONG_PTR)host_addr_space_limit >> 2;
+    low_range.start = (char *)address_space_start + (offset & ~granularity_mask);
+    low_range.end = max( low_range.start, low_range.end );
+
+    /* randomize high range */
+
+    if (is_win64)
+    {
+        offset = random[1];
+        top_down_wow_offset = (random[1] >> 8) & ~granularity_mask;
+    }
+    else offset = random[1] >> 8;
+
+    high_range.end = (char *)high_range.end - (offset & ~granularity_mask);
+    high_range.start = min( high_range.start, high_range.end );
+    TRACE( "low %p high %p\n", low_range.start, high_range.end );
+}
+
 
 /***********************************************************************
  *           virtual_alloc_first_thread_data
@@ -3898,19 +3954,16 @@ void virtual_alloc_first_teb(void)
     unsigned int status;
     struct file_view *view;
     struct thread_data *data = get_thread_data();
-    ULONG_PTR limit_low = 0, limit_high = 0;
 
     set_large_address_space();
+    randomize_address_space();
 
     teb_block_size = ROUND_SIZE( 0, sizeof(TEB), page_mask );
     if (is_wow64()) teb_block_size += ROUND_SIZE( 0, sizeof(WOW_TEB), page_mask );
     teb_block_size += page_size;  /* for debug info */
 
-    if (user_space_wow_limit) limit_high = user_space_wow_limit & ~granularity_mask;
-    else if (use_aslr()) limit_low = limit_4g;
-
-    status = map_view( &view, NULL, 16 * teb_block_size, 0,
-                       VPROT_READ | VPROT_WRITE, limit_low, limit_high, 0 );
+    status = map_view( &view, NULL, 16 * teb_block_size, 0, VPROT_READ | VPROT_WRITE,
+                       0, user_space_wow_limit & ~granularity_mask, 0 );
     assert( !status );
     teb_block = view->base;
     teb_block_pos = 14;
@@ -3955,13 +4008,9 @@ NTSTATUS virtual_alloc_teb( struct thread_data *data )
         if (!teb_block_pos)
         {
             struct file_view *view;
-            ULONG_PTR limit_low = 0, limit_high = 0;
 
-            if (user_space_wow_limit) limit_high = user_space_wow_limit & ~granularity_mask;
-            else if (use_aslr()) limit_low = limit_4g;
-
-            if ((status = map_view( &view, NULL, 32 * teb_block_size, 0,
-                                    VPROT_READ | VPROT_WRITE, limit_low, limit_high, 0 )))
+            if ((status = map_view( &view, NULL, 32 * teb_block_size, 0, VPROT_READ | VPROT_WRITE,
+                                    0, user_space_wow_limit & ~granularity_mask, 0 )))
             {
                 server_leave_uninterrupted_section( &virtual_mutex, &sigset );
                 return status;
@@ -5424,33 +5473,73 @@ static struct file_view *get_memory_region_size( char *base, char **region_start
     }
 #ifdef __i386__
     {
+        char *next, *end;
+        size_t size;
         unsigned int area = find_mem_area( base );
 
-        /* on i386, pretend that space outside of a reserved area is allocated,
-         * so that the app doesn't believe it's fully available */
+        /* on i386, check free space for host allocations so that the app
+         * doesn't believe it's fully available */
+
         if (mem_area_state( area ) != AREA_FREE)
         {
             *region_start = max( *region_start, (char *)mem_area_base( area ));
             *region_end   = min( *region_end, (char *)mem_area_end( area ));
             return NULL;
         }
+        if (mem_area_end( area ) <= address_space_start)
+        {
+            *region_end = min( *region_end, (char *)mem_area_end( area + 1 ));
+            return NULL;
+        }
+
+        end = min( *region_end, (char *)mem_area_end( area ));
 
         /* report the remaining part of the 64K after the view as free */
         if ((UINT_PTR)*region_start & granularity_mask)
         {
-            char *next = (char *)ROUND_ADDR( *region_start, granularity_mask ) + granularity_mask + 1;
+            next = (char *)ROUND_ADDR( *region_start, granularity_mask ) + granularity_mask + 1;
+            if (base < next) goto is_free;
+        }
 
-            if (base < next)
+        next = ROUND_ADDR( base, granularity_mask );
+        size = min( end - next, granularity_mask + 1 );
+        if (anon_mmap_tryfixed( next, size, PROT_NONE, MAP_NORESERVE ) == MAP_FAILED)
+        {
+            /* not free, look for the next free 64k block */
+            for (next += size; next < end; next += size)
             {
-                *region_end = min( next, *region_end );
-                return NULL;
+                size = min( end - next, granularity_mask + 1 );
+                if (anon_mmap_tryfixed( next, size, PROT_NONE, MAP_NORESERVE ) == MAP_FAILED) continue;
+                munmap( next, size );
+                break;
             }
             *region_start = base;
+            *region_end = next;
+            *fake_reserved = TRUE;
+            return NULL;
         }
-        /* pretend it's allocated */
-        if (mem_area_end( area ) <= address_space_start) area++;
-        *region_end = min( *region_end, (char *)mem_area_end( area ));
-        *fake_reserved = TRUE;
+
+        *region_start = next;
+        munmap( next, size );
+        next += size;
+
+     is_free:
+        /* free region, bisect the total free size */
+        size = end - next;
+        while (size)
+        {
+            if (anon_mmap_tryfixed( next, size, PROT_NONE, MAP_NORESERVE ) != MAP_FAILED)
+            {
+                munmap( next, size );
+                next += size;
+                size = end - next;
+            }
+            else size = (size / 2) & ~granularity_mask;
+        }
+        /* also include the next area if it's not allocated */
+        if (next == mem_area_end( area ) && mem_area_state( area + 1 ) == AREA_RESERVED)
+            next = mem_area_end( area + 1 );
+        *region_end = min( next, *region_end );
     }
 #endif
     return NULL;
