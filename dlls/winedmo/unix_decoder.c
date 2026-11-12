@@ -21,7 +21,14 @@
 #endif
 
 #include "config.h"
+
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
 #include "unix_private.h"
+
+#include <libavutil/hwcontext.h>
 
 #include "mfapi.h"
 #include "mmreg.h"
@@ -41,8 +48,84 @@ struct decoder
 {
     AVCodecContext *ctx;
     AVFrame *frame;
+    AVFrame *sw_frame; /* system memory copy of a hardware decoded frame */
+    BOOL vaapi_no_map; /* VA-API frames can't be mapped for reading */
     BOOL has_frame; /* frame holds output that hasn't been returned yet */
 };
+
+/* Hardware decoders to try, in order: NVDEC on NVIDIA's driver (its VA-API
+ * support is a third party wrapper), VA-API for Intel and AMD (and NVIDIA with
+ * that wrapper), then Vulkan Video on any driver that supports it. */
+static const struct
+{
+    enum AVHWDeviceType type;
+    enum AVPixelFormat format;
+    const char *name;
+}
+hw_decoders[] =
+{
+    {AV_HWDEVICE_TYPE_CUDA, AV_PIX_FMT_CUDA, "NVDEC"},
+    {AV_HWDEVICE_TYPE_VAAPI, AV_PIX_FMT_VAAPI, "VA-API"},
+    {AV_HWDEVICE_TYPE_VULKAN, AV_PIX_FMT_VULKAN, "Vulkan"},
+};
+
+/* Use the hardware decoder when FFmpeg offers it for the stream, otherwise
+ * whatever software format it prefers. FFmpeg calls this again without the
+ * hardware format if the hardware decoder fails to initialize. */
+static enum AVPixelFormat get_hw_format( AVCodecContext *ctx, const enum AVPixelFormat *formats )
+{
+    const AVHWDeviceContext *device = (const AVHWDeviceContext *)ctx->hw_device_ctx->data;
+    const enum AVPixelFormat *format;
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(hw_decoders); i++)
+    {
+        if (hw_decoders[i].type != device->type) continue;
+        for (format = formats; *format != AV_PIX_FMT_NONE; format++)
+        {
+            if (*format != hw_decoders[i].format) continue;
+            TRACE( "Decoding %s with %s\n", avcodec_get_name( ctx->codec_id ), hw_decoders[i].name );
+            return *format;
+        }
+    }
+
+    WARN( "No hardware decoding for %s, decoding in software\n", avcodec_get_name( ctx->codec_id ) );
+    return avcodec_default_get_format( ctx, formats );
+}
+
+static BOOL use_hw_decoder(void)
+{
+    const char *env = getenv( "WINEDMO_HWACCEL" );
+    return !env || strcmp( env, "0" );
+}
+
+/* Create a device for the first hardware decoder that works here. FFmpeg may
+ * be built without some of them, and the host may have no driver for them:
+ * then decoding stays in software. Returns whether one was found. */
+static BOOL init_hw_decoder( AVCodecContext *ctx )
+{
+    AVBufferRef *device;
+    unsigned int i;
+    int ret;
+
+    if (!use_hw_decoder()) return FALSE;
+
+    for (i = 0; i < ARRAY_SIZE(hw_decoders); i++)
+    {
+        if ((ret = av_hwdevice_ctx_create( &device, hw_decoders[i].type, NULL, NULL, 0 )) < 0)
+        {
+            TRACE( "No %s device, error %s\n", hw_decoders[i].name, debugstr_averr( ret ) );
+            continue;
+        }
+        TRACE( "Created %s device\n", hw_decoders[i].name );
+        ctx->hw_device_ctx = device;
+        ctx->get_format = get_hw_format;
+        return TRUE;
+    }
+
+    WARN( "No hardware decoder available, decoding in software\n" );
+    return FALSE;
+}
 
 static struct decoder *get_decoder( struct winedmo_decoder decoder )
 {
@@ -175,14 +258,26 @@ NTSTATUS decoder_create( void *arg )
     }
 
     if (!(decoder = calloc( 1, sizeof(*decoder) ))) return STATUS_NO_MEMORY;
-    if (!(decoder->frame = av_frame_alloc()) || !(decoder->ctx = ctx = avcodec_alloc_context3( codec )))
+    if (!(decoder->frame = av_frame_alloc()) || !(decoder->sw_frame = av_frame_alloc())
+            || !(decoder->ctx = ctx = avcodec_alloc_context3( codec )))
         goto failed;
 
     ctx->pkt_timebase = (AVRational){1, 10000000};
-    /* Frame threading holds back one frame per thread before the first output,
-     * Media Foundation decoders return frames as soon as they can. */
+    /* Most H.264 streams have one slice per frame, so slice threading alone
+     * decodes on one core, too slow for HD video. Frame threading holds back
+     * one frame per thread before the first output, and the media session
+     * feeds a decoder that returns no output ever more slowly, so keep the
+     * frame threads few. */
     ctx->thread_count = 0;
     ctx->thread_type = FF_THREAD_SLICE;
+    if (IsEqualGUID( &params->major, &MFMediaType_Video ))
+    {
+        long cpus = sysconf( _SC_NPROCESSORS_ONLN );
+        ctx->thread_count = cpus > 4 ? 4 : cpus > 1 ? cpus : 1;
+        ctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+        /* The GPU decodes; frame threads would only add latency and surfaces. */
+        if (init_hw_decoder( ctx )) ctx->thread_count = 1;
+    }
 
     if (IsEqualGUID( &params->major, &MFMediaType_Video ))
     {
@@ -223,6 +318,7 @@ NTSTATUS decoder_create( void *arg )
 
 failed:
     avcodec_free_context( &decoder->ctx );
+    av_frame_free( &decoder->sw_frame );
     av_frame_free( &decoder->frame );
     free( decoder );
     return STATUS_UNSUCCESSFUL;
@@ -236,6 +332,7 @@ NTSTATUS decoder_destroy( void *arg )
     TRACE( "decoder %p\n", decoder );
 
     avcodec_free_context( &decoder->ctx );
+    av_frame_free( &decoder->sw_frame );
     av_frame_free( &decoder->frame );
     free( decoder );
     return STATUS_SUCCESS;
@@ -496,11 +593,47 @@ NTSTATUS decoder_process_output( void *arg )
             WARN( "Failed to receive frame, error %s\n", debugstr_averr( ret ) );
             return STATUS_PENDING;
         }
+        if (frame->hw_frames_ctx)
+        {
+            /* Get a hardware decoded frame into system memory. A VA-API frame is
+             * mapped for reading, which has the driver copy the surface into an
+             * image (vaGetImage), and is written out from there; transferring it
+             * would copy it once more. Other devices can only transfer. */
+            AVFrame *sw_frame = decoder->sw_frame;
+            struct timespec t0, t1;
+
+            if (TRACE_ON(dmo)) clock_gettime( CLOCK_MONOTONIC, &t0 );
+            if (frame->format == AV_PIX_FMT_VAAPI && !decoder->vaapi_no_map
+                    && (ret = av_hwframe_map( sw_frame, frame, AV_HWFRAME_MAP_READ )) < 0)
+            {
+                WARN( "Failed to map VA-API frame, error %s, transferring instead\n", debugstr_averr( ret ) );
+                decoder->vaapi_no_map = TRUE;
+                av_frame_unref( sw_frame );
+            }
+            if ((!sw_frame->buf[0] && (ret = av_hwframe_transfer_data( sw_frame, frame, 0 )) < 0)
+                    || (ret = av_frame_copy_props( sw_frame, frame )) < 0)
+            {
+                WARN( "Failed to read back hardware frame, error %s\n", debugstr_averr( ret ) );
+                av_frame_unref( sw_frame );
+                av_frame_unref( frame );
+                return STATUS_PENDING;
+            }
+            if (TRACE_ON(dmo))
+            {
+                clock_gettime( CLOCK_MONOTONIC, &t1 );
+                TRACE( "Read back %s frame in %.2f ms\n", av_get_pix_fmt_name( sw_frame->format ),
+                       (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6 );
+            }
+            av_frame_unref( frame );
+            av_frame_move_ref( frame, sw_frame );
+        }
         decoder->has_frame = TRUE;
     }
 
     if (decoder->ctx->codec_type == AVMEDIA_TYPE_VIDEO)
     {
+        struct timespec t0, t1;
+
         /* the output may be larger, padded to the coded size, but not smaller
          * or more than one macroblock larger */
         if (frame->width > format->width || frame->height > format->height
@@ -511,7 +644,15 @@ NTSTATUS decoder_process_output( void *arg )
             format->height = frame->height;
             return STATUS_MEDIA_CHANGED;
         }
+
+        if (TRACE_ON(dmo)) clock_gettime( CLOCK_MONOTONIC, &t0 );
         status = write_video_frame( frame, format, (BYTE *)(UINT_PTR)sample->data, &sample->size );
+        if (TRACE_ON(dmo) && !status && sample->data)
+        {
+            clock_gettime( CLOCK_MONOTONIC, &t1 );
+            TRACE( "Wrote %s frame in %.2f ms\n", av_get_pix_fmt_name( frame->format ),
+                   (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6 );
+        }
         sample->duration = frame_duration( frame );
     }
     else

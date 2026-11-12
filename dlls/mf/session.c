@@ -213,6 +213,7 @@ struct topo_node
         struct
         {
             unsigned int requests;
+            BOOL allocator_empty;
             IMFVideoSampleAllocatorNotify notify_cb;
             IMFVideoSampleAllocator *allocator;
             IMFVideoSampleAllocatorCallback *allocator_cb;
@@ -3020,8 +3021,13 @@ static HRESULT WINAPI session_sa_ready_callback_Invoke(IMFAsyncCallback *iface, 
 
     EnterCriticalSection(&session->cs);
 
-    if (topo_node->u.sink.requests)
+    /* Samples are also released after a transform returned no output into them.
+     * Processing again then would only release another sample and notify again,
+     * flooding the work queue while the transform waits for more input. */
+    if (topo_node->u.sink.allocator_empty && topo_node->u.sink.requests)
     {
+        topo_node->u.sink.allocator_empty = FALSE;
+
         if (!(up_node = session_get_topo_node_input(session, topo_node, 0, &output)))
             WARN("Failed to node %p/%u input\n", topo_node, 0);
         else
@@ -3564,7 +3570,11 @@ static HRESULT transform_get_external_output_sample(const struct media_session *
 
     if (topo_node->type == MF_TOPOLOGY_OUTPUT_NODE && topo_node->u.sink.allocator)
     {
+        /* Remember running out of samples, so that the release notification
+         * resumes processing only then. */
         hr = IMFVideoSampleAllocator_AllocateSample(topo_node->u.sink.allocator, sample);
+        if (hr == MF_E_SAMPLEALLOCATOR_EMPTY)
+            topo_node->u.sink.allocator_empty = TRUE;
     }
     else
     {
