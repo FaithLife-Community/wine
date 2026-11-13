@@ -2080,7 +2080,8 @@ static BOOL use_gst_byte_stream_handler(void)
                        RRF_RT_REG_DWORD, NULL, &result, &size ))
         return !result;
 
-    return TRUE;
+    /* oinos: the FFmpeg media source is the default */
+    return FALSE;
 }
 
 static HRESULT WINAPI asf_byte_stream_plugin_factory_CreateInstance(IClassFactory *iface,
