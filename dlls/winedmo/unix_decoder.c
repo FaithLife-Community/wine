@@ -39,6 +39,23 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(dmo);
 
+/* wall-clock and this thread's CPU time, for the TRACEs below */
+struct trace_time { struct timespec wall, cpu; };
+
+static void trace_time_start( struct trace_time *t )
+{
+    clock_gettime( CLOCK_MONOTONIC, &t->wall );
+    clock_gettime( CLOCK_THREAD_CPUTIME_ID, &t->cpu );
+}
+
+static double elapsed_ms( const struct timespec *from, clockid_t clock )
+{
+    struct timespec now;
+    clock_gettime( clock, &now );
+    return (now.tv_sec - from->tv_sec) * 1e3 + (now.tv_nsec - from->tv_nsec) / 1e6;
+}
+
+
 static inline const char *debugstr_averr( int err )
 {
     return wine_dbg_sprintf( "%d (%s)", err, av_err2str(err) );
@@ -344,6 +361,7 @@ NTSTATUS decoder_process_input( void *arg )
     struct decoder *decoder = get_decoder( params->decoder );
     struct sample *sample = &params->sample;
     AVPacket *packet;
+    struct trace_time t0;
     int ret;
 
     TRACE( "decoder %p, size %#"PRIx64", pts %"PRId64"\n", decoder, sample->size, sample->pts );
@@ -366,7 +384,11 @@ NTSTATUS decoder_process_input( void *arg )
     packet->pts = sample->pts == INT64_MIN ? AV_NOPTS_VALUE : sample->pts;
     packet->duration = sample->duration == INT64_MIN ? 0 : sample->duration;
 
+    if (TRACE_ON(dmo)) trace_time_start( &t0 );
     ret = avcodec_send_packet( decoder->ctx, packet );
+    if (TRACE_ON(dmo) && decoder->ctx->codec_type == AVMEDIA_TYPE_VIDEO)
+        TRACE( "Decoded %d-byte packet in %.2f ms (%.2f ms CPU)\n", packet->size,
+               elapsed_ms( &t0.wall, CLOCK_MONOTONIC ), elapsed_ms( &t0.cpu, CLOCK_THREAD_CPUTIME_ID ) );
     av_packet_free( &packet );
 
     if (ret == AVERROR(EAGAIN)) return STATUS_PENDING;
@@ -600,9 +622,9 @@ NTSTATUS decoder_process_output( void *arg )
              * image (vaGetImage), and is written out from there; transferring it
              * would copy it once more. Other devices can only transfer. */
             AVFrame *sw_frame = decoder->sw_frame;
-            struct timespec t0, t1;
+            struct trace_time t0;
 
-            if (TRACE_ON(dmo)) clock_gettime( CLOCK_MONOTONIC, &t0 );
+            if (TRACE_ON(dmo)) trace_time_start( &t0 );
             if (frame->format == AV_PIX_FMT_VAAPI && !decoder->vaapi_no_map
                     && (ret = av_hwframe_map( sw_frame, frame, AV_HWFRAME_MAP_READ )) < 0)
             {
@@ -619,11 +641,8 @@ NTSTATUS decoder_process_output( void *arg )
                 return STATUS_PENDING;
             }
             if (TRACE_ON(dmo))
-            {
-                clock_gettime( CLOCK_MONOTONIC, &t1 );
-                TRACE( "Read back %s frame in %.2f ms\n", av_get_pix_fmt_name( sw_frame->format ),
-                       (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6 );
-            }
+                TRACE( "Read back %s frame in %.2f ms (%.2f ms CPU)\n", av_get_pix_fmt_name( sw_frame->format ),
+                       elapsed_ms( &t0.wall, CLOCK_MONOTONIC ), elapsed_ms( &t0.cpu, CLOCK_THREAD_CPUTIME_ID ) );
             av_frame_unref( frame );
             av_frame_move_ref( frame, sw_frame );
         }
@@ -632,7 +651,7 @@ NTSTATUS decoder_process_output( void *arg )
 
     if (decoder->ctx->codec_type == AVMEDIA_TYPE_VIDEO)
     {
-        struct timespec t0, t1;
+        struct trace_time t0;
 
         /* the output may be larger, padded to the coded size, but not smaller
          * or more than one macroblock larger */
@@ -645,14 +664,11 @@ NTSTATUS decoder_process_output( void *arg )
             return STATUS_MEDIA_CHANGED;
         }
 
-        if (TRACE_ON(dmo)) clock_gettime( CLOCK_MONOTONIC, &t0 );
+        if (TRACE_ON(dmo)) trace_time_start( &t0 );
         status = write_video_frame( frame, format, (BYTE *)(UINT_PTR)sample->data, &sample->size );
         if (TRACE_ON(dmo) && !status && sample->data)
-        {
-            clock_gettime( CLOCK_MONOTONIC, &t1 );
-            TRACE( "Wrote %s frame in %.2f ms\n", av_get_pix_fmt_name( frame->format ),
-                   (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6 );
-        }
+            TRACE( "Wrote %s frame in %.2f ms (%.2f ms CPU)\n", av_get_pix_fmt_name( frame->format ),
+                   elapsed_ms( &t0.wall, CLOCK_MONOTONIC ), elapsed_ms( &t0.cpu, CLOCK_THREAD_CPUTIME_ID ) );
         sample->duration = frame_duration( frame );
     }
     else
