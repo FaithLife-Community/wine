@@ -3345,6 +3345,8 @@ static HRESULT WINAPI dwritefontcollection_FindFamilyName(IDWriteFontCollection3
 
     *index = collection_find_family(collection, name);
     *exists = *index != ~0u;
+    if (!*exists)
+        WARN("Family %s not found in collection %p.\n", debugstr_w(name), iface);
     return S_OK;
 }
 
