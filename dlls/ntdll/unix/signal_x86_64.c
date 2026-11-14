@@ -2498,6 +2498,56 @@ static void quit_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 }
 
 
+/***********************************************************************
+ *           is_leaving_syscall
+ *
+ * The syscall dispatcher's return path leaves %rsp inside the syscall frame
+ * (at frame->rip, or one slot below while restoring the flags) until it switches
+ * to the user stack, so is_inside_syscall() no longer counts the thread as
+ * inside the syscall. The thread's user context is still entirely in the frame.
+ */
+static BOOL is_leaving_syscall( struct thread_data *data, ucontext_t *sigcontext )
+{
+    struct syscall_frame *frame = get_syscall_frame( data );
+    ULONG_PTR sp = RSP_sig(sigcontext);
+
+    return frame && sp > (ULONG_PTR)frame && sp <= (ULONG_PTR)&frame->rip;
+}
+
+
+/***********************************************************************
+ *           restart_syscall_return
+ *
+ * Rewind a thread interrupted in the syscall dispatcher's return path to the start
+ * of that path, so that it is handled as being inside the syscall: its context is
+ * reported from the frame (instead of a kernel stack pointer and a host instruction
+ * pointer), and a context set while it's suspended is restored from the frame.
+ */
+static void restart_syscall_return( struct thread_data *data, ucontext_t *sigcontext )
+{
+    extern const void *__wine_syscall_dispatcher_retval_r11_ptr, *__wine_syscall_dispatcher_retval_r11_end_ptr;
+    struct syscall_frame *frame = get_syscall_frame( data );
+    void *rip = (void *)RIP_sig(sigcontext);
+    ULONG_PTR retval = RAX_sig(sigcontext);
+
+    /* the return value is moved out of %rax while %rax is needed for xrstor */
+    if (rip >= __wine_syscall_dispatcher_retval_r11_ptr && rip < __wine_syscall_dispatcher_retval_r11_end_ptr)
+        retval = R11_sig(sigcontext);
+#ifdef __APPLE__
+    {
+        extern const void *__wine_syscall_dispatcher_retval_r8_ptr, *__wine_syscall_dispatcher_retval_r8_end_ptr;
+        if (rip >= __wine_syscall_dispatcher_retval_r8_ptr && rip < __wine_syscall_dispatcher_retval_r8_end_ptr)
+            retval = R8_sig(sigcontext);
+    }
+#endif
+    TRACE_(seh)( "restarting syscall return at ip %p, frame %p\n", rip, frame );
+    RAX_sig(sigcontext) = retval;
+    R13_sig(sigcontext) = (ULONG_PTR)data->teb;
+    RSP_sig(sigcontext) = (ULONG_PTR)frame;
+    RIP_sig(sigcontext) = (ULONG_PTR)__wine_syscall_dispatcher_return;
+}
+
+
 /**********************************************************************
  *		usr1_handler
  *
@@ -2507,6 +2557,9 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
 {
     ucontext_t *sigcontext = _sigcontext;
     struct thread_data *data = init_handler( sigcontext );
+
+    if (data->teb && is_leaving_syscall( data, sigcontext ))
+        restart_syscall_return( data, sigcontext );
 
     if (!data->teb)
     {
@@ -3166,6 +3219,7 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    "1:\n\t"
 #elif defined __APPLE__
                    "movq %rax,%r8\n\t"
+                   __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_retval_r8") ":\n\t"
                    "movq %rcx,%rdx\n\t"
                    "movq %r13,%rdi\n\t"            /* teb */
                    "xorl %esi,%esi\n\t"
@@ -3173,6 +3227,7 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    "syscall\n\t"
                    "movq %rdx,%rcx\n\t"
                    "movq %r8,%rax\n\t"
+                   __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_retval_r8_end") ":\n\t"
 #endif
                    "movl 0xb4(%rcx),%edx\n\t"      /* frame->restore_flags */
                    "testl $0x48,%edx\n\t"          /* CONTEXT_FLOATING_POINT | CONTEXT_XSTATE */
@@ -3192,10 +3247,12 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    "2:\tcmpb $0,0x7ffe0285\n\t"    /* user_shared_data->ProcessorFeatures[PF_XSAVE_ENABLED] */
                    "jz 3f\n\t"
                    "movq %rax,%r11\n\t"
+                   __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_retval_r11") ":\n\t"
                    "movl 0x7ffe03d8,%eax\n\t"      /* user_shared_data->XState.EnabledFeatures */
                    "movl 0x7ffe03dc,%edx\n\t"
                    "xrstor64 0xc0(%rcx)\n\t"
                    "movq %r11,%rax\n\t"
+                   __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_retval_r11_end") ":\n\t"
                    "movl 0xb4(%rcx),%edx\n\t"      /* frame->restore_flags */
                    "jmp 4f\n"
                    "3:\tfxrstor64 0xc0(%rcx)\n"
@@ -3485,5 +3542,15 @@ __ASM_GLOBAL_POINTER( __ASM_NAME("__wine_unix_call_dispatcher_prolog_end_ptr"),
                       __ASM_LOCAL_LABEL("__wine_unix_call_dispatcher_prolog_end") )
 __ASM_GLOBAL_POINTER( __ASM_NAME("__wine_unix_call_dispatcher_gs_load_ptr"),
                       __ASM_LOCAL_LABEL("__wine_unix_call_dispatcher_gs_load") )
+__ASM_GLOBAL_POINTER( __ASM_NAME("__wine_syscall_dispatcher_retval_r11_ptr"),
+                      __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_retval_r11") )
+__ASM_GLOBAL_POINTER( __ASM_NAME("__wine_syscall_dispatcher_retval_r11_end_ptr"),
+                      __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_retval_r11_end") )
+#ifdef __APPLE__
+__ASM_GLOBAL_POINTER( __ASM_NAME("__wine_syscall_dispatcher_retval_r8_ptr"),
+                      __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_retval_r8") )
+__ASM_GLOBAL_POINTER( __ASM_NAME("__wine_syscall_dispatcher_retval_r8_end_ptr"),
+                      __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_retval_r8_end") )
+#endif
 
 #endif  /* __x86_64__ */

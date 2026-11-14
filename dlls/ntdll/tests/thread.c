@@ -570,6 +570,61 @@ static void test_arm64_skip_loader_init(void)
     CloseHandle( thread );
 }
 
+#ifdef __x86_64__
+static volatile LONG suspend_test_stop;
+
+static DWORD WINAPI syscall_loop_thread( void *arg )
+{
+    while (!suspend_test_stop) NtGetCurrentProcessorNumber();
+    return 0;
+}
+
+/* A suspended thread's context must point into its own stack, even when it's
+ * suspended while returning from a system call: profilers and garbage collectors
+ * walk the stack from Rsp up to StackBase. */
+static void test_suspended_context_stack(void)
+{
+    THREAD_BASIC_INFORMATION info;
+    NT_TIB *tib;
+    TEB *teb;
+    CONTEXT context;
+    HANDLE thread;
+    NTSTATUS status;
+    unsigned int i, outside = 0, count = 0;
+    DWORD start;
+
+    suspend_test_stop = 0;
+    thread = CreateThread( NULL, 0, syscall_loop_thread, NULL, 0, NULL );
+    ok( thread != NULL, "CreateThread failed %lu\n", GetLastError() );
+    status = NtQueryInformationThread( thread, ThreadBasicInformation, &info, sizeof(info), NULL );
+    ok( !status, "NtQueryInformationThread failed %#lx\n", status );
+    teb = info.TebBaseAddress;
+    tib = &teb->Tib;
+
+    start = GetTickCount();
+    for (i = 0; i < 20000 && GetTickCount() - start < 5000; i++)
+    {
+        if (SuspendThread( thread ) == ~0u) break;
+        context.ContextFlags = CONTEXT_CONTROL;
+        if (GetThreadContext( thread, &context ))
+        {
+            count++;
+            if (context.Rsp < (ULONG_PTR)teb->DeallocationStack || context.Rsp >= (ULONG_PTR)tib->StackBase)
+            {
+                if (!outside++)
+                    ok( 0, "Rsp %#I64x Rip %#I64x outside the thread's stack %p-%p\n", context.Rsp,
+                        context.Rip, teb->DeallocationStack, tib->StackBase );
+            }
+        }
+        ResumeThread( thread );
+    }
+    suspend_test_stop = 1;
+    WaitForSingleObject( thread, INFINITE );
+    CloseHandle( thread );
+    ok( !outside, "%u of %u contexts had Rsp outside the thread's stack\n", outside, count );
+}
+#endif
+
 START_TEST(thread)
 {
     char **argv;
@@ -612,4 +667,7 @@ START_TEST(thread)
     test_thread_bypass_process_freeze();
     test_NtQueueApcThreadEx();
     test_skip_thread_attach();
+#ifdef __x86_64__
+    test_suspended_context_stack();
+#endif
 }
