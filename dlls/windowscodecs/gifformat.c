@@ -685,6 +685,7 @@ static HRESULT CDECL gif_decoder_initialize(struct decoder *iface, IStream *stre
     if (ret == GIF_ERROR)
     {
         DGifCloseFile(decoder->gif);
+        decoder->gif = NULL;
         IStream_Release(stream);
         decoder->stream = NULL;
         return E_FAIL;

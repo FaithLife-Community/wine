@@ -558,6 +558,40 @@ static void test_truncated_gif(void)
     IStream_Release(stream);
 }
 
+/* Valid header, then an image descriptor cut short. */
+static const char gif_truncated_image_desc[] = {
+/* LSD */'G','I','F','8','9','a',0x01,0x00,0x01,0x00,0x00,0x00,0x00,
+/* IMD */0x2c,0x00,0x00
+};
+
+static void test_gif_truncated_frame_header(void)
+{
+    IWICBitmapDecoder *decoder;
+    IStream *stream;
+    HRESULT hr;
+    int i;
+
+    /* A decoder that fails to read the frame headers must not free them
+     * again when it is destroyed. Repeat it so that heap damage shows up. */
+    for (i = 0; i < 64; i++)
+    {
+        stream = create_stream(gif_truncated_image_desc, sizeof(gif_truncated_image_desc));
+        if (!stream) return;
+
+        decoder = NULL;
+        hr = IWICImagingFactory_CreateDecoderFromStream(factory, stream, NULL, 0, &decoder);
+        if (SUCCEEDED(hr))
+        {
+            ok(decoder != NULL, "got NULL decoder\n");
+            IWICBitmapDecoder_Release(decoder);
+        }
+        else
+            ok(!decoder, "got decoder %p, hr %#lx\n", decoder, hr);
+
+        IStream_Release(stream);
+    }
+}
+
 /* 1x1 pixel gif, missing trailer */
 static unsigned char gifimage_notrailer[] = {
 0x47,0x49,0x46,0x38,0x37,0x61,0x01,0x00,0x01,0x00,0x80,0x00,0x71,0xff,0xff,0xff,
@@ -1115,6 +1149,7 @@ START_TEST(gifformat)
     test_gif_frame_sizes();
     test_gif_full_table();
     test_truncated_gif();
+    test_gif_truncated_frame_header();
 
     IWICImagingFactory_Release(factory);
 }
