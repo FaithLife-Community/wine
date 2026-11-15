@@ -4701,7 +4701,25 @@ HRESULT create_font_collection(IDWriteFactory7 *factory, IDWriteFontFileEnumerat
         }
         else
         {
-            WARN("Set builder failed to add a file.\n");
+            IDWriteFontFileStream *stream;
+            UINT64 size = 0;
+            const void *data = NULL;
+            void *context;
+            UINT32 magic = 0;
+
+            if (SUCCEEDED(get_filestream_from_file(file, &stream)))
+            {
+                IDWriteFontFileStream_GetFileSize(stream, &size);
+                if (size >= sizeof(magic) && SUCCEEDED(IDWriteFontFileStream_ReadFileFragment(stream, &data, 0,
+                        sizeof(magic), &context)))
+                {
+                    memcpy(&magic, data, sizeof(magic));
+                    IDWriteFontFileStream_ReleaseFileFragment(stream, context);
+                }
+                IDWriteFontFileStream_Release(stream);
+            }
+            WARN("Set builder failed to add a file, hr %#lx, size %s, tag %08x.\n", hr,
+                    wine_dbgstr_longlong(size), RtlUlongByteSwap(magic));
             IDWriteFontFile_Release(file);
             hr = S_OK;
         }
