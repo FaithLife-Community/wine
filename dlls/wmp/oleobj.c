@@ -58,10 +58,23 @@ static HWND get_container_hwnd(WindowsMediaPlayer *This)
 
 static LRESULT WINAPI wmp_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
+    WindowsMediaPlayer *wmp = (WindowsMediaPlayer *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+
     switch(msg) {
+    case WM_NCCREATE: {
+        CREATESTRUCTW *cs = (CREATESTRUCTW *)lParam;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)cs->lpCreateParams);
+        break;
+    }
+    case WM_ERASEBKGND:
+        /* The video renderer draws the whole client area. */
+        return 1;
+    case WM_SIZE:
+        if(wmp && wmp->mf_player)
+            IMFPMediaPlayer_UpdateVideo(wmp->mf_player);
+        break;
     case WM_PAINT: {
         PAINTSTRUCT ps;
-        HFONT font;
         RECT rect;
         HDC hdc;
 
@@ -69,20 +82,13 @@ static LRESULT WINAPI wmp_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 
         GetClientRect(hwnd, &rect);
         hdc = BeginPaint(hwnd, &ps);
-
-        SelectObject(hdc, GetStockObject(DC_BRUSH));
-        SetDCBrushColor(hdc, RGB(255,0,0));
-        SetBkColor(hdc, RGB(255,0,0));
-
-        font = CreateFontA(25,0,0,0,400,0,0,0,ANSI_CHARSET,0,0,DEFAULT_QUALITY,DEFAULT_PITCH,NULL);
-        SelectObject(hdc, font);
-
-        Rectangle(hdc, rect.left, rect.top, rect.right, rect.bottom);
-        DrawTextA(hdc, "FIXME: WMP", -1, &rect, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
-
-        DeleteObject(font);
+        /* Black like native until (or where) the video renderer draws. */
+        FillRect(hdc, &rect, GetStockObject(BLACK_BRUSH));
         EndPaint(hwnd, &ps);
-        break;
+
+        if(wmp && wmp->mf_player)
+            IMFPMediaPlayer_UpdateVideo(wmp->mf_player);
+        return 0;
     }
     }
 
@@ -122,7 +128,7 @@ static HWND create_wmp_window(WindowsMediaPlayer *wmp, const RECT *posrect)
 
     return CreateWindowExW(0, MAKEINTRESOURCEW(wmp_class), NULL, WS_CLIPCHILDREN|WS_CLIPSIBLINGS|WS_VISIBLE|WS_CHILD,
             posrect->left, posrect->top, posrect->right-posrect->left, posrect->bottom-posrect->top,
-            get_container_hwnd(wmp), NULL, wmp_instance, NULL);
+            get_container_hwnd(wmp), NULL, wmp_instance, wmp);
 }
 
 static HRESULT activate_inplace(WindowsMediaPlayer *This)

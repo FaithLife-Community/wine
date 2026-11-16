@@ -1730,6 +1730,9 @@ static HRESULT open_media(WindowsMediaPlayer *This)
 
     update_state(This, DISPID_WMPCOREEVENT_OPENSTATECHANGE, wmposOpeningUnknownURL);
 
+    /* mfplay only renders video into the window it's created with. */
+    if (!This->hwnd)
+        TRACE("No control window yet; video won't be shown.\n");
     hr = MFPCreateMediaPlayer(NULL, FALSE, 0, &This->IMFPMediaPlayerCallback_iface, This->hwnd, &This->mf_player);
     if (SUCCEEDED(hr))
     {
