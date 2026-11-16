@@ -3251,6 +3251,16 @@ static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size
     status = map_image_view( &view, &pe_mapping->image, size, limit_low, limit_high, alloc_type );
     if (status) goto done;
 
+    /* the address the server assigned may already be in use, e.g. by host libraries;
+     * relocate to where the image ended up and report its entry point from there */
+    if (pe_mapping->image.map_addr && pe_mapping->image.map_addr != wine_server_client_ptr( view->base ))
+    {
+        TRACE_(module)( "%s not mapped at assigned address %s, using %p\n",
+                        debugstr_us(&pe_mapping->nt_name),
+                        wine_dbgstr_longlong( pe_mapping->image.map_addr ), view->base );
+        pe_mapping->image.map_addr = wine_server_client_ptr( view->base );
+    }
+
     status = map_image_into_view( view, &pe_mapping->nt_name, unix_fd, &pe_mapping->image,
                                   machine, shared_fd, needs_close );
     if (status == STATUS_SUCCESS)
