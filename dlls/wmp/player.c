@@ -1721,6 +1721,11 @@ static HRESULT create_remote_media_item(WindowsMediaPlayer *This, const WCHAR *u
 
 /* A host that renders the video itself (IWMPVideoRenderConfig) gets an EVR using its presenter
  * on the first video stream. Without one, mfplay only shows video in the control's window. */
+/* MF_ACTIVATE_CUSTOM_VIDEO_PRESENTER_ACTIVATE lives in mfuuid, which clashes with the GUIDs
+ * wmp_main.c already defines through initguid.h. */
+static const GUID custom_presenter_activate_attr =
+    {0xba491365, 0xbe50, 0x451e, {0x95, 0xab, 0x6d, 0x4a, 0xcc, 0xc7, 0xda, 0xd8}};
+
 static void attach_custom_presenter(WindowsMediaPlayer *This, IMFPMediaItem *item)
 {
     IMFPresentationDescriptor *pd = NULL;
@@ -1763,7 +1768,7 @@ static void attach_custom_presenter(WindowsMediaPlayer *This, IMFPMediaItem *ite
 
         if (SUCCEEDED(hr = MFCreateVideoRendererActivate(NULL, &evr)))
         {
-            hr = IMFActivate_SetUnknown(evr, &MF_ACTIVATE_CUSTOM_VIDEO_PRESENTER_ACTIVATE,
+            hr = IMFActivate_SetUnknown(evr, &custom_presenter_activate_attr,
                     (IUnknown *)This->presenter_activate);
             if (SUCCEEDED(hr))
                 hr = IMFPMediaItem_SetStreamSink(item, i, (IUnknown *)evr);

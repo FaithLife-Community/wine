@@ -1,5 +1,5 @@
 MODULE    = wmp.dll
-IMPORTS   = mfplay mf mfplat uuid mfuuid wininet oleaut32 ole32 urlmon shlwapi user32 gdi32
+IMPORTS   = mfplay mf mfplat uuid wininet oleaut32 ole32 urlmon shlwapi user32 gdi32
 
 VER_FILEDESCRIPTION_STR = "Wine Media Player"
 VER_PRODUCTVERSION      = 12,0,7601,16982
