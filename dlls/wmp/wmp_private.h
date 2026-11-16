@@ -25,6 +25,7 @@
 #include "mfidl.h"
 #include "mfplay.h"
 #include "wmp.h"
+#include "wmprealestate.h"
 
 #define TID_LIST \
     XIID(NULL) \
@@ -85,6 +86,7 @@ struct WindowsMediaPlayer {
     IWMPSettings IWMPSettings_iface;
     IWMPControls IWMPControls_iface;
     IWMPNetwork IWMPNetwork_iface;
+    IWMPVideoRenderConfig IWMPVideoRenderConfig_iface;
 
     LONG ref;
 
@@ -116,6 +118,7 @@ struct WindowsMediaPlayer {
     double seek_from;        /* position before the seek, for PositionChange */
     unsigned int pending_seeks;
     BOOL async_play;         /* play started from the MEDIAITEM_SET callback */
+    IMFActivate *presenter_activate; /* the host's EVR presenter (IWMPVideoRenderConfig) */
 
     /* Async event notification */
     HWND msg_window;

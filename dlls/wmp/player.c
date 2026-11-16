@@ -1719,6 +1719,68 @@ static HRESULT create_remote_media_item(WindowsMediaPlayer *This, const WCHAR *u
     return hr;
 }
 
+/* A host that renders the video itself (IWMPVideoRenderConfig) gets an EVR using its presenter
+ * on the first video stream. Without one, mfplay only shows video in the control's window. */
+static void attach_custom_presenter(WindowsMediaPlayer *This, IMFPMediaItem *item)
+{
+    IMFPresentationDescriptor *pd = NULL;
+    IMFMediaTypeHandler *handler;
+    IMFMediaSource *source = NULL;
+    IMFStreamDescriptor *sd;
+    IUnknown *object = NULL;
+    IMFActivate *evr;
+    DWORD i, count = 0;
+    BOOL selected;
+    GUID major;
+    HRESULT hr;
+
+    if (!This->presenter_activate)
+        return;
+
+    hr = IMFPMediaItem_GetObject(item, &object);
+    if (SUCCEEDED(hr))
+        hr = IUnknown_QueryInterface(object, &IID_IMFMediaSource, (void **)&source);
+    if (SUCCEEDED(hr))
+        hr = IMFMediaSource_CreatePresentationDescriptor(source, &pd);
+    if (SUCCEEDED(hr))
+        hr = IMFPresentationDescriptor_GetStreamDescriptorCount(pd, &count);
+    if (FAILED(hr))
+        WARN("Can't find the streams, hr %#lx; the host's presenter won't be used.\n", hr);
+
+    for (i = 0; i < count; ++i)
+    {
+        if (FAILED(IMFPresentationDescriptor_GetStreamDescriptorByIndex(pd, i, &selected, &sd)))
+            continue;
+        hr = IMFStreamDescriptor_GetMediaTypeHandler(sd, &handler);
+        if (SUCCEEDED(hr))
+        {
+            hr = IMFMediaTypeHandler_GetMajorType(handler, &major);
+            IMFMediaTypeHandler_Release(handler);
+        }
+        IMFStreamDescriptor_Release(sd);
+        if (FAILED(hr) || !IsEqualGUID(&major, &MFMediaType_Video))
+            continue;
+
+        if (SUCCEEDED(hr = MFCreateVideoRendererActivate(NULL, &evr)))
+        {
+            hr = IMFActivate_SetUnknown(evr, &MF_ACTIVATE_CUSTOM_VIDEO_PRESENTER_ACTIVATE,
+                    (IUnknown *)This->presenter_activate);
+            if (SUCCEEDED(hr))
+                hr = IMFPMediaItem_SetStreamSink(item, i, (IUnknown *)evr);
+            IMFActivate_Release(evr);
+        }
+        TRACE("Video stream %lu goes to the host's presenter, hr %#lx.\n", i, hr);
+        break;
+    }
+
+    if (pd)
+        IMFPresentationDescriptor_Release(pd);
+    if (source)
+        IMFMediaSource_Release(source);
+    if (object)
+        IUnknown_Release(object);
+}
+
 static HRESULT open_media(WindowsMediaPlayer *This)
 {
     WCHAR *path = resolve_media_url(This->media->url);
@@ -1730,8 +1792,8 @@ static HRESULT open_media(WindowsMediaPlayer *This)
 
     update_state(This, DISPID_WMPCOREEVENT_OPENSTATECHANGE, wmposOpeningUnknownURL);
 
-    /* mfplay only renders video into the window it's created with. */
-    if (!This->hwnd)
+    /* mfplay only renders video into the window it's created with, unless the host gave us a presenter. */
+    if (!This->hwnd && !This->presenter_activate)
         TRACE("No control window yet; video won't be shown.\n");
     hr = MFPCreateMediaPlayer(NULL, FALSE, 0, &This->IMFPMediaPlayerCallback_iface, This->hwnd, &This->mf_player);
     if (SUCCEEDED(hr))
@@ -1756,6 +1818,7 @@ static HRESULT open_media(WindowsMediaPlayer *This)
         }
         IMFPMediaItem_GetCharacteristics(item, &characteristics);
         TRACE("Opened media, duration %f, characteristics %#x.\n", This->media->duration, characteristics);
+        attach_custom_presenter(This, item);
         /* The item is set asynchronously; playback starts once MFP_EVENT_TYPE_MEDIAITEM_SET arrives. */
         hr = IMFPMediaPlayer_SetMediaItem(This->mf_player, item);
     }
@@ -2656,6 +2719,50 @@ void unregister_player_msg_class(void) {
         UnregisterClassW(MAKEINTRESOURCEW(player_msg_class), wmp_instance);
 }
 
+static inline WindowsMediaPlayer *impl_from_IWMPVideoRenderConfig(IWMPVideoRenderConfig *iface)
+{
+    return CONTAINING_RECORD(iface, WindowsMediaPlayer, IWMPVideoRenderConfig_iface);
+}
+
+static HRESULT WINAPI WMPVideoRenderConfig_QueryInterface(IWMPVideoRenderConfig *iface, REFIID riid, void **ppv)
+{
+    WindowsMediaPlayer *This = impl_from_IWMPVideoRenderConfig(iface);
+    return IOleObject_QueryInterface(&This->IOleObject_iface, riid, ppv);
+}
+
+static ULONG WINAPI WMPVideoRenderConfig_AddRef(IWMPVideoRenderConfig *iface)
+{
+    WindowsMediaPlayer *This = impl_from_IWMPVideoRenderConfig(iface);
+    return IOleObject_AddRef(&This->IOleObject_iface);
+}
+
+static ULONG WINAPI WMPVideoRenderConfig_Release(IWMPVideoRenderConfig *iface)
+{
+    WindowsMediaPlayer *This = impl_from_IWMPVideoRenderConfig(iface);
+    return IOleObject_Release(&This->IOleObject_iface);
+}
+
+static HRESULT WINAPI WMPVideoRenderConfig_put_presenterActivate(IWMPVideoRenderConfig *iface, IMFActivate *activate)
+{
+    WindowsMediaPlayer *This = impl_from_IWMPVideoRenderConfig(iface);
+
+    TRACE("(%p)->(%p)\n", This, activate);
+
+    if (activate)
+        IMFActivate_AddRef(activate);
+    if (This->presenter_activate)
+        IMFActivate_Release(This->presenter_activate);
+    This->presenter_activate = activate;
+    return S_OK;
+}
+
+static const IWMPVideoRenderConfigVtbl WMPVideoRenderConfigVtbl = {
+    WMPVideoRenderConfig_QueryInterface,
+    WMPVideoRenderConfig_AddRef,
+    WMPVideoRenderConfig_Release,
+    WMPVideoRenderConfig_put_presenterActivate
+};
+
 BOOL init_player(WindowsMediaPlayer *wmp)
 {
     IWMPPlaylist *playlist;
@@ -2678,6 +2785,7 @@ BOOL init_player(WindowsMediaPlayer *wmp)
     wmp->IWMPSettings_iface.lpVtbl = &WMPSettingsVtbl;
     wmp->IWMPControls_iface.lpVtbl = &WMPControlsVtbl;
     wmp->IWMPNetwork_iface.lpVtbl = &WMPNetworkVtbl;
+    wmp->IWMPVideoRenderConfig_iface.lpVtbl = &WMPVideoRenderConfigVtbl;
     wmp->IMFPMediaPlayerCallback_iface.lpVtbl = &mfp_callback_vtbl;
     wmp->pending_position = wmp->seek_position = -1.0;
 
@@ -2702,6 +2810,8 @@ void destroy_player(WindowsMediaPlayer *wmp)
         IWMPMedia_Release(&wmp->media->IWMPMedia_iface);
     if (wmp->playlist)
         IWMPPlaylist_Release(&wmp->playlist->IWMPPlaylist_iface);
+    if (wmp->presenter_activate)
+        IMFActivate_Release(wmp->presenter_activate);
     DestroyWindow(wmp->msg_window);
 }
 
