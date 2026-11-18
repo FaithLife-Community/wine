@@ -665,6 +665,7 @@ static const struct user_driver_funcs x11drv_funcs =
     .pCreateWindowSurface = X11DRV_CreateWindowSurface,
     .pMoveWindowBits = X11DRV_MoveWindowBits,
     .pWindowPosChanged = X11DRV_WindowPosChanged,
+    .pGetTouchContactCount = X11DRV_GetTouchContactCount,
     .pSystemParametersInfo = X11DRV_SystemParametersInfo,
     .pWintabProc = X11DRV_WintabProc,
     .pVulkanInit = X11DRV_VulkanInit,

@@ -396,6 +396,26 @@ void x11drv_xinput2_init( struct x11drv_thread_data *data )
         return;
     }
 
+    if (major > 2 || (major == 2 && minor >= 2))
+    {
+        XIDeviceInfo *devices = pXIQueryDevice( data->display, XIAllDevices, &count );
+
+        for (int i = 0; devices && i < count; ++i)
+        {
+            if (!devices[i].enabled || devices[i].use != XISlavePointer) continue;
+            for (int j = 0; j < devices[i].num_classes; ++j)
+            {
+                XITouchClassInfo *touch = (XITouchClassInfo *)devices[i].classes[j];
+
+                if (touch->type != XITouchClass || touch->mode != XIDirectTouch) continue;
+                /* XI2 uses zero when the hardware does not specify a limit. */
+                unsigned int contacts = touch->num_touches > 0 ? touch->num_touches : 10;
+                data->touch_contacts = max( data->touch_contacts, min( contacts, WINE_TOUCH_MAX_CONTACTS ));
+            }
+        }
+        if (devices) pXIFreeDeviceInfo( devices );
+    }
+
     data->root_events.deviceid = XIAllMasterDevices;
     data->root_events.mask_len = sizeof(data->root_mask);
     data->root_events.mask = data->root_mask;
@@ -1848,6 +1868,15 @@ static BOOL X11DRV_TouchEvent( HWND hwnd, XGenericEventCookie *xev )
 /***********************************************************************
  *              x11drv_xinput2_load
  */
+UINT X11DRV_GetTouchContactCount(void)
+{
+#ifdef HAVE_X11_EXTENSIONS_XINPUT2_H
+    return x11drv_init_thread_data()->touch_contacts;
+#else
+    return 0;
+#endif
+}
+
 void x11drv_xinput2_load(void)
 {
 #if defined(SONAME_LIBXI) && defined(HAVE_X11_EXTENSIONS_XINPUT2_H)

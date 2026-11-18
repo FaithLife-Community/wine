@@ -7082,6 +7082,11 @@ int get_system_metrics( int index )
         return get_system_metrics( SM_CYMAXIMIZED ) - get_system_metrics( SM_CYMIN );
     case SM_CYKANJIWINDOW:
         return 0;
+    case SM_MAXIMUMTOUCHES:
+        return user_driver->pGetTouchContactCount();
+    case SM_DIGITIZER:
+        ret = user_driver->pGetTouchContactCount();
+        return ret ? NID_READY | NID_INTEGRATED_TOUCH | (ret > 1 ? NID_MULTI_INPUT : 0) : 0;
     case SM_MOUSEPRESENT:
         return 1;
     case SM_DEBUG:
@@ -7669,6 +7674,9 @@ ULONG_PTR WINAPI NtUserCallOneParam( ULONG_PTR arg, ULONG code )
 
     case NtUserCallOneParam_GetSysColorPen:
         return HandleToUlong( get_sys_color_pen(arg) );
+
+    case NtUserCallOneParam_GetTouchCursorId:
+        return get_touch_cursor_id( arg );
 
     case NtUserCallOneParam_GetSystemMetrics:
         return get_system_metrics( arg );

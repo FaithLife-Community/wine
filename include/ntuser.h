@@ -1108,6 +1108,10 @@ static inline HWND NtUserGetTaskmanWindow(void)
     return UlongToHandle( NtUserCallNoParam( NtUserCallNoParam_GetTaskmanWindow ));
 }
 
+/* Single logical direct-touch device exposed by the X11 pointer backend. */
+#define WINE_TOUCH_DEVICE UlongToHandle( 0x10002 )
+#define WINE_TOUCH_MAX_CONTACTS 32u
+
 /* NtUserCallOneParam codes, not compatible with Windows */
 enum
 {
@@ -1126,6 +1130,7 @@ enum
     NtUserCallOneParam_SetThreadDpiAwarenessContext,
     NtUserCallOneParam_D3DKMTOpenAdapterFromGdiDisplayName,
     NtUserCallOneParam_GetAsyncKeyboardState,
+    NtUserCallOneParam_GetTouchCursorId,
     /* temporary exports */
     NtUserGetDeskPattern,
 };

@@ -624,9 +624,9 @@
 @ stdcall GetOpenClipboardWindow() NtUserGetOpenClipboardWindow
 @ stdcall GetParent(long)
 @ stdcall GetPhysicalCursorPos(ptr)
-# @ stub GetPointerCursorId
+@ stdcall GetPointerCursorId(long ptr)
 # @ stub GetPointerDevice
-# @ stub GetPointerDeviceCursors
+@ stdcall GetPointerDeviceCursors(ptr ptr ptr)
 # @ stub GetPointerDeviceInputSpace
 # @ stub GetPointerDeviceOrientation
 @ stdcall GetPointerDeviceProperties(ptr ptr ptr)

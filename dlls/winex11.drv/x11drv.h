@@ -432,6 +432,7 @@ struct x11drv_thread_data
     XIValuatorClassInfo y_valuator;
     double              raw_x;
     double              raw_y;
+    UINT     touch_contacts;      /* Capacity of the direct-touch device on this connection */
     int      xinput2_pointer;      /* XInput2 master pointer device id */
 #endif /* HAVE_X11_EXTENSIONS_XINPUT2_H */
     int      root_window_users;    /* counter for root window XISelectEvents */
@@ -622,6 +623,7 @@ extern BOOL X11DRV_GenericEvent( HWND hwnd, XEvent *event );
 extern int xinput2_opcode;
 extern void x11drv_xinput2_load(void);
 extern void x11drv_xinput2_init( struct x11drv_thread_data *data );
+extern UINT X11DRV_GetTouchContactCount(void);
 extern void x11drv_xinput2_enable( Display *display, Window window );
 extern void x11drv_xinput2_disable( Display *display, Window window );
 

@@ -417,6 +417,8 @@ struct pointer
     struct list entry;
     POINTER_INPUT_TYPE type;
     POINTER_INFO info;
+    UINT cursor_id;
+    BOOL touch_active;
 };
 
 BOOL grab_pointer = TRUE;
@@ -2996,9 +2998,30 @@ static struct pointer *find_pointer( UINT32 id )
     return NULL;
 }
 
+UINT get_touch_cursor_id( UINT id )
+{
+    struct pointer *pointer = find_pointer( id );
+
+    return pointer && pointer->type == PT_TOUCH ? pointer->cursor_id : 0;
+}
+
+static UINT allocate_touch_cursor( UINT count )
+{
+    struct pointer *pointer;
+    UINT32 used = 0;
+
+    LIST_FOR_EACH_ENTRY( pointer, &get_user_thread_info()->known_pointers, struct pointer, entry )
+        if (pointer->touch_active && pointer->cursor_id)
+            used |= 1u << (pointer->cursor_id - 1);
+
+    for (UINT i = 0; i < count; ++i)
+        if (!(used & (1u << i))) return i + 1;
+    return 0;
+}
+
 static POINTER_INFO pointer_info_from_msg( const MSG *msg )
 {
-    POINT location = { LOWORD( msg->lParam ), HIWORD( msg->lParam ) };
+    POINT location = { (short)LOWORD( msg->lParam ), (short)HIWORD( msg->lParam ) };
     LARGE_INTEGER counter;
     POINTER_INFO info =
     {
@@ -3063,6 +3086,19 @@ void update_pointer_from_msg( POINTER_INPUT_TYPE type, const MSG *msg )
     TRACE( "updating pointer id %d.\n", info.pointerId );
 
     if (!(pointer = find_pointer( info.pointerId )) && !(pointer = pointer_create( info.pointerId, type ))) return;
+
+    pointer->type = type;
+    if (type == PT_TOUCH)
+    {
+        if (!pointer->touch_active && (msg->message == WM_POINTERENTER || msg->message == WM_POINTERDOWN))
+        {
+            pointer->cursor_id = allocate_touch_cursor( user_driver->pGetTouchContactCount() );
+            pointer->touch_active = TRUE;
+        }
+        if (pointer->cursor_id) info.sourceDevice = WINE_TOUCH_DEVICE;
+        /* Keep the cursor ID available to callers handling UP and LEAVE. */
+        if (msg->message == WM_POINTERLEAVE || msg->message == WM_POINTERUP) pointer->touch_active = FALSE;
+    }
 
     buttons = compare_button( &pointer->info, &info );
     pointer->info = info;
@@ -3181,6 +3217,19 @@ BOOL WINAPI NtUserGetPointerDeviceRects( HANDLE handle, RECT *device_rect, RECT 
 {
     RECT rect;
 
+    if (!device_rect || !display_rect)
+    {
+        RtlSetLastWin32Error( ERROR_INVALID_PARAMETER );
+        return FALSE;
+    }
+    if (handle == WINE_TOUCH_DEVICE && user_driver->pGetTouchContactCount())
+    {
+        rect = get_primary_monitor_rect( no_dpi );
+        *display_rect = rect;
+        SetRect( device_rect, 0, 0, (rect.right - rect.left) * HIMETRIC_PER_INCH / system_dpi,
+                 (rect.bottom - rect.top) * HIMETRIC_PER_INCH / system_dpi );
+        return TRUE;
+    }
     if (handle != INVALID_HANDLE_VALUE)
     {
         FIXME( "Pointer devices are not implemented!\n" );

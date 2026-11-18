@@ -742,12 +742,69 @@ BOOL WINAPI SetGestureConfig( HWND hwnd, DWORD reserved, UINT count,
     return FALSE;
 }
 
-BOOL WINAPI GetPointerDeviceProperties( HANDLE device, UINT32 *count,
-                                        POINTER_DEVICE_PROPERTY *properties)
+static BOOL pointer_buffer_size( UINT32 *count, UINT needed, const void *buffer )
 {
-    FIXME( "device %p, count %p, info %p stub!\n", device, count, properties );
-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
-    return FALSE;
+    if (!count)
+    {
+        SetLastError( ERROR_INVALID_PARAMETER );
+        return FALSE;
+    }
+    if (buffer && *count < needed)
+    {
+        *count = needed;
+        SetLastError( ERROR_INSUFFICIENT_BUFFER );
+        return FALSE;
+    }
+    *count = needed;
+    return TRUE;
+}
+
+BOOL WINAPI GetPointerDeviceCursors( HANDLE device, UINT32 *count, POINTER_DEVICE_CURSOR_INFO *cursors )
+{
+    UINT contacts = GetSystemMetrics( SM_MAXIMUMTOUCHES );
+
+    if (device != WINE_TOUCH_DEVICE || !contacts)
+    {
+        SetLastError( ERROR_INVALID_HANDLE );
+        return FALSE;
+    }
+    if (!pointer_buffer_size( count, contacts, cursors )) return FALSE;
+    if (cursors)
+        for (UINT i = 0; i < contacts; ++i)
+            cursors[i] = (POINTER_DEVICE_CURSOR_INFO){ i + 1, POINTER_DEVICE_CURSOR_TYPE_TIP };
+    return TRUE;
+}
+
+BOOL WINAPI GetPointerCursorId( UINT32 id, UINT32 *cursor )
+{
+    UINT value;
+
+    if (!cursor || !(value = NtUserCallOneParam( id, NtUserCallOneParam_GetTouchCursorId )))
+    {
+        SetLastError( ERROR_INVALID_PARAMETER );
+        return FALSE;
+    }
+    *cursor = value;
+    return TRUE;
+}
+
+BOOL WINAPI GetPointerDeviceProperties( HANDLE device, UINT32 *count, POINTER_DEVICE_PROPERTY *properties )
+{
+    RECT physical, screen;
+
+    if (device != WINE_TOUCH_DEVICE || !NtUserGetPointerDeviceRects( device, &physical, &screen ))
+    {
+        SetLastError( ERROR_INVALID_HANDLE );
+        return FALSE;
+    }
+    if (!pointer_buffer_size( count, 2, properties )) return FALSE;
+    if (properties)
+    {
+        /* Generic Desktop X/Y, physical ranges in hundredths of a centimetre. */
+        properties[0] = (POINTER_DEVICE_PROPERTY){ 0, screen.right - screen.left, 0, physical.right, 0x11, 0xe, 1, 0x30 };
+        properties[1] = (POINTER_DEVICE_PROPERTY){ 0, screen.bottom - screen.top, 0, physical.bottom, 0x11, 0xe, 1, 0x31 };
+    }
+    return TRUE;
 }
 
 BOOL WINAPI GetPointerPenInfo( UINT32 id, POINTER_PEN_INFO *info )
@@ -771,10 +828,30 @@ BOOL WINAPI GetPointerTouchInfo( UINT32 id, POINTER_TOUCH_INFO *info )
 BOOL WINAPI GetRawPointerDeviceData( UINT32 id, UINT32 hist_count, UINT32 prop_count,
                                      POINTER_DEVICE_PROPERTY *properties, LONG *values )
 {
-    FIXME( "id %u, count %u, prop_count %u, properties %p, values %p stub!\n",
-           id, hist_count, prop_count, properties, values );
-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
-    return FALSE;
+    POINTER_INFO info;
+
+    if (hist_count != 1 || !prop_count || !properties || !values)
+    {
+        SetLastError( ERROR_INVALID_PARAMETER );
+        return FALSE;
+    }
+    if (!GetPointerInfo( id, &info )) return FALSE;
+    if (info.sourceDevice != WINE_TOUCH_DEVICE)
+    {
+        SetLastError( ERROR_NO_DATA );
+        return FALSE;
+    }
+    for (UINT i = 0; i < prop_count; ++i)
+    {
+        if (properties[i].usagePageId != 1 || (properties[i].usageId != 0x30 && properties[i].usageId != 0x31))
+        {
+            SetLastError( ERROR_INVALID_PARAMETER );
+            return FALSE;
+        }
+    }
+    for (UINT i = 0; i < prop_count; ++i)
+        values[i] = properties[i].usageId == 0x30 ? info.ptPixelLocationRaw.x : info.ptPixelLocationRaw.y;
+    return TRUE;
 }
 
 BOOL WINAPI GetPointerTouchInfoHistory( UINT32 id, UINT32 *count, POINTER_TOUCH_INFO *info )

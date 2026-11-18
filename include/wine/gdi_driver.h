@@ -224,7 +224,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when you change the DC function table */
-#define WINE_GDI_DRIVER_VERSION 110
+#define WINE_GDI_DRIVER_VERSION 111
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -441,6 +441,7 @@ struct user_driver_funcs
     void    (*pWindowPosChanged)(HWND,HWND,HWND,UINT,const struct window_rects*,struct window_surface*);
     /* system parameters */
     BOOL    (*pSystemParametersInfo)(UINT,UINT,void*,UINT);
+    UINT    (*pGetTouchContactCount)(void);
     /* wintab support */
     LRESULT (*pWintabProc)(HWND,UINT,WPARAM,LPARAM,void*);
     /* vulkan support */

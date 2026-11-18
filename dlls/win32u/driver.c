@@ -928,6 +928,11 @@ static BOOL nulldrv_SystemParametersInfo( UINT action, UINT int_param, void *ptr
     return FALSE;
 }
 
+static UINT nulldrv_GetTouchContactCount(void)
+{
+    return 0;
+}
+
 static LRESULT nulldrv_WintabProc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, void *buffer )
 {
     return 0;
@@ -1253,6 +1258,11 @@ static void loaderdrv_UpdateLayeredWindow( HWND hwnd, BYTE alpha, UINT flags )
     load_driver()->pUpdateLayeredWindow( hwnd, alpha, flags );
 }
 
+static UINT loaderdrv_GetTouchContactCount(void)
+{
+    return load_driver()->pGetTouchContactCount();
+}
+
 static LRESULT loaderdrv_WintabProc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, void *buffer )
 {
     return load_driver()->pWintabProc( hwnd, msg, wparam, lparam, buffer );
@@ -1337,6 +1347,7 @@ static const struct user_driver_funcs lazy_load_driver =
     nulldrv_WindowPosChanged,
     /* system parameters */
     nulldrv_SystemParametersInfo,
+    loaderdrv_GetTouchContactCount,
     /* wintab support */
     loaderdrv_WintabProc,
     /* vulkan support */
@@ -1436,6 +1447,7 @@ void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version
     SET_USER_FUNC(MoveWindowBits);
     SET_USER_FUNC(WindowPosChanged);
     SET_USER_FUNC(SystemParametersInfo);
+    SET_USER_FUNC(GetTouchContactCount);
     SET_USER_FUNC(WintabProc);
     SET_USER_FUNC(VulkanInit);
     SET_USER_FUNC(OpenGLInit);

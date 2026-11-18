@@ -472,15 +472,33 @@ BOOL WINAPI RegisterPointerDeviceNotifications(HWND hwnd, BOOL notifyrange)
  */
 BOOL WINAPI GetPointerDevices(UINT32 *device_count, POINTER_DEVICE_INFO *devices)
 {
-    FIXME("(%p %p): partial stub\n", device_count, devices);
+    UINT contacts = GetSystemMetrics( SM_MAXIMUMTOUCHES );
+    POINT origin = {0};
+    UINT needed = !!contacts;
 
     if (!device_count)
+    {
+        SetLastError( ERROR_INVALID_PARAMETER );
         return FALSE;
-
-    if (devices)
+    }
+    if (devices && *device_count < needed)
+    {
+        *device_count = needed;
+        SetLastError( ERROR_INSUFFICIENT_BUFFER );
         return FALSE;
-
-    *device_count = 0;
+    }
+    if (devices && needed)
+    {
+        *devices = (POINTER_DEVICE_INFO){
+            .device = WINE_TOUCH_DEVICE,
+            .pointerDeviceType = POINTER_DEVICE_TYPE_TOUCH,
+            .monitor = MonitorFromPoint( origin, MONITOR_DEFAULTTOPRIMARY ),
+            .startingCursorId = 1,
+            .maxActiveContacts = contacts,
+            .productString = L"Wine touchscreen",
+        };
+    }
+    *device_count = needed;
     return TRUE;
 }
 
