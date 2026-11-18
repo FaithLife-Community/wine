@@ -1821,7 +1821,7 @@ static BOOL X11DRV_TouchEvent( HWND hwnd, XGenericEventCookie *xev )
     {
     case XI_TouchBegin:
         input.hi.uMsg = WM_POINTERDOWN;
-        flags |= POINTER_MESSAGE_FLAG_NEW;
+        flags = POINTER_MESSAGE_FLAG_NEW | POINTER_MESSAGE_FLAG_INRANGE | POINTER_MESSAGE_FLAG_INCONTACT;
         TRACE("XI_TouchBegin detail %u pos %dx%d, flags %#x\n", event->detail, pos.x, pos.y, flags);
         break;
     case XI_TouchEnd:
@@ -1830,12 +1830,13 @@ static BOOL X11DRV_TouchEvent( HWND hwnd, XGenericEventCookie *xev )
         break;
     case XI_TouchUpdate:
         input.hi.uMsg = WM_POINTERUPDATE;
+        flags = POINTER_MESSAGE_FLAG_INRANGE | POINTER_MESSAGE_FLAG_INCONTACT;
         TRACE("XI_TouchUpdate detail %u pos %dx%d, flags %#x\n", event->detail, pos.x, pos.y, flags);
         break;
     }
 
     input.hi.wParamL = event->detail;
-    input.hi.wParamH = POINTER_MESSAGE_FLAG_INRANGE | POINTER_MESSAGE_FLAG_INCONTACT | flags;
+    input.hi.wParamH = flags;
     NtUserSendHardwareInput( hwnd, 0, &input, MAKELPARAM( pos.x, pos.y ) );
 
     return TRUE;
