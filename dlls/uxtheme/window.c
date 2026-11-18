@@ -27,6 +27,23 @@
 #include "uxthemedll.h"
 #include "vssym32.h"
 
+/* Window overpan animation is unavailable. Callers use the return from
+ * BeginPanningFeedback to decide whether to send updates for the gesture. */
+BOOL WINAPI BeginPanningFeedback(HWND hwnd)
+{
+    return FALSE;
+}
+
+BOOL WINAPI UpdatePanningFeedback(HWND hwnd, LONG x, LONG y, BOOL inertia)
+{
+    return FALSE;
+}
+
+BOOL WINAPI EndPanningFeedback(HWND hwnd, BOOL animate)
+{
+    return FALSE;
+}
+
 static void uxtheme_draw_menu_button(HTHEME theme, HWND hwnd, HDC hdc, enum NONCLIENT_BUTTON_TYPE type,
                                      RECT rect, BOOL down, BOOL grayed)
 {

@@ -230,6 +230,10 @@ THEMEAPI SetWindowThemeAttribute(HWND,enum WINDOWTHEMEATTRIBUTETYPE,PVOID,DWORD)
 
 typedef HANDLE HPAINTBUFFER;
 
+THEMEAPI_(BOOL) BeginPanningFeedback(HWND);
+THEMEAPI_(BOOL) UpdatePanningFeedback(HWND,LONG,LONG,BOOL);
+THEMEAPI_(BOOL) EndPanningFeedback(HWND,BOOL);
+
 THEMEAPI BufferedPaintInit(VOID);
 THEMEAPI BufferedPaintUnInit(VOID);
 

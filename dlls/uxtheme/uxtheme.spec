@@ -58,6 +58,7 @@
 # Standard functions
 @ stdcall BeginBufferedAnimation(ptr ptr ptr long ptr ptr ptr ptr)
 @ stdcall BeginBufferedPaint(ptr ptr long ptr ptr)
+@ stdcall BeginPanningFeedback(ptr)
 @ stdcall BufferedPaintClear(ptr ptr)
 @ stdcall BufferedPaintInit()
 @ stdcall BufferedPaintRenderAnimation(ptr ptr)
@@ -75,6 +76,7 @@
 @ stdcall EnableTheming(long)
 @ stdcall EndBufferedAnimation(ptr long)
 @ stdcall EndBufferedPaint(ptr long)
+@ stdcall EndPanningFeedback(ptr long)
 @ stdcall GetBufferedPaintBits(ptr ptr ptr)
 @ stdcall GetBufferedPaintDC(ptr)
 @ stdcall GetBufferedPaintTargetDC(ptr)
@@ -124,3 +126,4 @@
 @ stdcall SetThemeAppProperties(long)
 @ stdcall SetWindowTheme(ptr wstr wstr)
 @ stdcall SetWindowThemeAttribute(ptr long ptr long)
+@ stdcall UpdatePanningFeedback(ptr long long long)
